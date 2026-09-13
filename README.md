@@ -154,3 +154,8 @@ nightly rebuild alone is a no-op whenever the layer cache is warm:
 Findings and scheduled-build failures are raised as GitHub issues. Full reasoning,
 including the one failure mode to watch (GitHub disables cron after 60 days of
 repository inactivity), is in [`docs/DEPLOYMENT.md` §3a](docs/DEPLOYMENT.md).
+
+## License
+
+[MIT](LICENSE) — matching `docker-library/php`, the upstream project the
+`php:*-fpm` base image is built from.

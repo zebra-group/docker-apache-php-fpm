@@ -26,11 +26,12 @@ ARG IGBINARY_VERSION=3.2.17RC1
 # default. Set to false if the app never renders PDF previews.
 ARG IMAGEMAGICK_ALLOW_PDF=true
 
-# No org.opencontainers.image.licenses label: the repository does not declare a
-# license, so there is nothing accurate to put here. Add one once LICENSE exists.
+# MIT, matching the base image: docker-library/php (which php:*-fpm is built
+# from) is MIT-licensed, so this stays consistent with what it builds on.
 LABEL org.opencontainers.image.source="https://github.com/zebra-group/docker-apache-php-fpm" \
       org.opencontainers.image.title="php-fpm-apache" \
-      org.opencontainers.image.description="Apache + PHP-FPM base image for TYPO3, WordPress and Grav"
+      org.opencontainers.image.description="Apache + PHP-FPM base image for TYPO3, WordPress and Grav" \
+      org.opencontainers.image.licenses="MIT"
 
 # Must exist *before* locale-gen runs. Previously this was copied afterwards,
 # so the intended locale list was never generated and the image depended on the
