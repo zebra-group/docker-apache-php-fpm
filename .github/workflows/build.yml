@@ -66,7 +66,7 @@ jobs:
           shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh
 
       - name: Lint Dockerfile
-        uses: hadolint/hadolint-action@v3.4.0
+        uses: hadolint/hadolint-action@v3.5.0
         with:
           dockerfile: docker/Dockerfile
           # DL3008: we deliberately do not pin apt versions — the daily rebuild
