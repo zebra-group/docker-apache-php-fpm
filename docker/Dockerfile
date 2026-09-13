@@ -85,6 +85,12 @@ buildPackages=(
 )
 
 apt-get update
+# Packages already present in the base image (e.g. perl) are never touched by
+# the install below, since that only adds the packages named above — an OS CVE
+# fixed upstream would otherwise survive every rebuild, cached or not, until
+# the base image itself gets rebuilt. `upgrade` (not `dist-upgrade`) never
+# removes or adds packages, so it cannot fight the slimming step further down.
+apt-get upgrade -y
 apt-get install -y --no-install-recommends "${runtimePackages[@]}" "${buildPackages[@]}"
 
 # GD with webp + avif: TYPO3 13 and WordPress both emit WebP derivatives, which

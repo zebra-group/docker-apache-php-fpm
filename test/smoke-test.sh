@@ -159,6 +159,13 @@ devpkgs="$(docker run --rm --entrypoint sh "${IMAGE}" -c \
      | awk '\$4 == \"installed\" && \$1 ~ /-dev\$/' | wc -l | tr -d ' '")"
 assert_eq "no -dev packages remain" "0" "${devpkgs}"
 
+# apt-get install only adds the packages this image names explicitly; without
+# a separate upgrade step, an already-installed base-image package with a
+# known fixed CVE (e.g. perl) would survive every rebuild untouched.
+upgradable="$(docker run --rm --entrypoint sh "${IMAGE}" -c \
+    'apt-get update -qq >/dev/null 2>&1; apt list --upgradable 2>/dev/null | grep -vc "^Listing"')"
+assert_eq "no upgradable OS packages remain after build" "0" "${upgradable}"
+
 assert_eq "locales-all (231 MB) removed" "absent" "$(pkg_state locales-all)"
 assert_eq "unused mod_fcgid removed" "absent" "$(pkg_state libapache2-mod-fcgid)"
 assert_eq "obsolete libmcrypt-dev removed" "absent" "$(pkg_state libmcrypt-dev)"

@@ -221,12 +221,15 @@ cache and the whole image is rebuilt. This is the main path: the official PHP
 images are rebuilt when Debian ships security updates, so most patches arrive
 here.
 
-**Weekly cache bypass.** On Sundays the build runs with `no-cache: true`, so
-every package is reinstalled at its current version regardless of whether the
-base image moved. This is the backstop for updates that the base image does not
-force. Only the test build bypasses the cache; the subsequent push build reuses
-what it just produced, so even a from-scratch run compiles each architecture
-once. Force one at any time:
+**Weekly cache bypass.** On Sundays the build runs with `no-cache: true`, so the
+install layer re-executes regardless of whether the base image moved. Within
+that layer, `apt-get upgrade -y` runs before the package install — without it,
+re-running the layer only reinstalls the packages this Dockerfile names
+explicitly, and a package the *base image* already had (e.g. `perl`) survives
+untouched even across a from-scratch rebuild. This is the backstop for updates
+the base image does not force. Only the test build bypasses the cache; the
+subsequent push build reuses what it just produced, so even a from-scratch run
+compiles each architecture once. Force one at any time:
 
 ```sh
 gh workflow run build.yml -f no_cache=true
