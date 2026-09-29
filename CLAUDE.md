@@ -27,14 +27,14 @@ test/smoke-test.sh php-fpm-apache:local
 Lint before committing (CI does the same):
 
 ```sh
-shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh
+shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh .github/scripts/apt-index-fingerprint.sh
 ```
 
 ## CI / Release
 
 Four workflows, each answering a different question — see `docs/DEPLOYMENT.md` §3a for the full reasoning.
 
-`.github/workflows/build.yml` runs daily (cron), on manual dispatch, and on push/PR touching `docker/`, `test/` or the workflow. Pipeline: `lint` (shellcheck + hadolint) → `build` as 4 versions × 2 architectures on **native runners** (`ubuntu-latest` / `ubuntu-24.04-arm`, no QEMU), each building, smoke-testing, Trivy-scanning and pushing by digest → `merge` assembling one multi-arch manifest per tag. A `notify-failure` job opens an issue when a scheduled run fails.
+`.github/workflows/build.yml` runs daily (cron), on manual dispatch, and on push/PR touching `docker/`, `test/`, `.github/scripts/` or the workflow. Pipeline: `lint` (shellcheck + hadolint) → `build` as 4 versions × 2 architectures on **native runners** (`ubuntu-latest` / `ubuntu-24.04-arm`, no QEMU), each building, smoke-testing, Trivy-scanning and pushing by digest → `merge` assembling one multi-arch manifest per tag. A `notify-failure` job opens an issue when a scheduled run fails.
 
 Tags are created **only** in the merge job, so a tag can never reference a half-built set of architectures; the merge job then asserts both architectures are present in what it published. Native runners also mean arm64 is finally smoke-tested — under QEMU it could only be built, since a multi-platform image cannot be loaded into the local daemon. arm64 runners are free because this repo is public; if it ever goes private they become a paid feature and unavailable labels cause jobs to **queue rather than fail**.
 
@@ -44,7 +44,7 @@ Tags are created **only** in the merge job, so a tag can never reference a half-
 - Tags per build: rolling `:<version>`, immutable `:<version>-<date>` and `:<version>-<sha>`, plus `:latest` for whichever version `LATEST_PHP` names.
 - Buildx cache is scoped per PHP version (`scope=php-8.4`). Do not collapse this to a shared key — the matrix jobs then overwrite each other's cache.
 
-**A daily rebuild does not by itself pick up OS security updates.** BuildKit keys the install layer on instruction text plus parent digest, so with a warm cache the `apt-get` step never runs and the build is a no-op. Three things depend on this understanding, and none should be removed as redundant: `pull: true` (re-resolves the base tag so a moved digest busts the cache), the Sunday `no-cache` run (reinstalls packages even when the base image did not move), and the separate scan of published images (catches CVEs disclosed after build time). `--ignore-unfixed` on the scans is also load-bearing: PHP 8.4 currently has 126 HIGH/CRITICAL findings of which 0 are fixable, so an unfiltered alert would be permanent noise.
+**A daily rebuild does not by itself pick up OS security updates.** BuildKit keys the install layer on instruction text plus parent digest, so with a warm cache the `apt-get` step never runs and the build is a no-op. Four things depend on this understanding, and none should be removed as redundant: `pull: true` (re-resolves the base tag so a moved digest busts the cache), the `APT_INDEX_FINGERPRINT` build arg (a hash of the Debian package indices from `.github/scripts/apt-index-fingerprint.sh`, declared but never read in the Dockerfile — it busts the install layer exactly when Debian publishes an update; both build steps must get the same value or the push build diverges from the tested image), the Sunday `no-cache` run (backstop, rebuilds from nothing), and the separate scan of published images (catches CVEs disclosed after build time). `--ignore-unfixed` on the scans is also load-bearing: PHP 8.4 currently has 126 HIGH/CRITICAL findings of which 0 are fixable, so an unfiltered alert would be permanent noise.
 
 ## Architecture notes
 

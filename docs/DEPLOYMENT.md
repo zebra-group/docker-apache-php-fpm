@@ -206,12 +206,13 @@ layer digest. With a warm cache the entire `apt-get` step is a cache hit and
 never executes. A nightly build against an unchanged base image produces a
 byte-identical image and picks up nothing.
 
-Four mechanisms cover the gap, each answering a different question:
+Five mechanisms cover the gap, each answering a different question:
 
 | Workflow | Cadence | Answers |
 |---|---|---|
 | `build.yml` | daily 00:00 UTC | Is there a newer `php:*-fpm`? (new PHP patch release, or Debian updates the official image baked in) |
-| `build.yml` with `no-cache` | Sundays | Are there Debian updates for the packages *we* install, that the base image did not force? |
+| `build.yml` apt fingerprint | daily 00:00 UTC | Has Debian published package updates since the cached install layer was built? |
+| `build.yml` with `no-cache` | Sundays | Backstop: rebuild from nothing, in case something slipped past the two above |
 | `security-scan.yml` | daily 06:00 UTC | Is what we already published vulnerable *today*? |
 | `pin-drift.yml` + Dependabot | weekly | Are the PECL pins and action versions stale? |
 
@@ -221,13 +222,39 @@ cache and the whole image is rebuilt. This is the main path: the official PHP
 images are rebuilt when Debian ships security updates, so most patches arrive
 here.
 
+**Daily apt fingerprint.** The official images are not rebuilt for every Debian
+update, and never for packages only *we* install (`libheif`, `imagemagick`,
+...). So before building, each job runs
+`.github/scripts/apt-index-fingerprint.sh php:<version>-fpm`: it runs
+`apt-get update` inside the base image and hashes the resulting Debian package
+indices (main, `-updates`, `-security`, decompressed, for the runner's
+architecture). The hash is passed as the build argument `APT_INDEX_FINGERPRINT`,
+which the Dockerfile declares but never reads — its only job is to be part of
+the install layer's cache key. Net effect:
+
+- Debian published nothing → same fingerprint → install layer cached (~2 min per job)
+- Debian published anything → new fingerprint → install layer and everything
+  after it rebuild (~5 min per job), and the update is in the image the next
+  morning
+
+Within that layer, `apt-get upgrade -y` runs before the package install —
+without it, re-running the layer only reinstalls the packages this Dockerfile
+names explicitly, and a package the *base image* already had (e.g. `perl`)
+survives untouched even across a from-scratch rebuild.
+
+Both build steps (test build and push build) must receive the same fingerprint;
+otherwise the push build misses the cache and publishes a different image than
+the one that was tested. Local builds leave the argument empty and cache as
+before.
+
+Before this existed, the smoke test *"no upgradable OS packages remain after
+build"* failed every night between a mid-week Debian update and the Sunday
+cache bypass (e.g. `libheif1` 1.19.8 → 1.23.4 in September 2026).
+
 **Weekly cache bypass.** On Sundays the build runs with `no-cache: true`, so the
-install layer re-executes regardless of whether the base image moved. Within
-that layer, `apt-get upgrade -y` runs before the package install — without it,
-re-running the layer only reinstalls the packages this Dockerfile names
-explicitly, and a package the *base image* already had (e.g. `perl`) survives
-untouched even across a from-scratch rebuild. This is the backstop for updates
-the base image does not force. Only the test build bypasses the cache; the
+whole image is rebuilt from nothing regardless of base image or fingerprint —
+the backstop in case a change slips past both (e.g. a package repository the
+fingerprint does not cover). Only the test build bypasses the cache; the
 subsequent push build reuses what it just produced, so even a from-scratch run
 compiles each architecture once. Force one at any time:
 
@@ -578,6 +605,17 @@ File-based sessions in `/tmp`, plus more than one replica. Switch to Redis.
 Signals are not reaching the processes. The entrypoint traps `TERM` and sends
 Apache `SIGWINCH` (graceful stop) and FPM `SIGQUIT`; shutdown should take about a
 second on an idle container. If it does not, check that `tini` is still PID 1.
+
+**Nightly build fails on "no upgradable OS packages remain after build".**
+The install layer came from the cache although Debian has newer packages. Check
+the run summary: if the apt fingerprint did not change between the last green
+run and this one, the build log shows the `RUN ... <<'INSTALL'` step as
+`CACHED`. Likely causes: the fingerprint step no longer receives the base image
+the build uses, or the two build steps got different `APT_INDEX_FINGERPRINT`
+values. Run `.github/scripts/apt-index-fingerprint.sh php:8.4-fpm` twice locally
+— it must print the same hash both times, and a different one after Debian
+publishes an update. `gh workflow run build.yml -f no_cache=true` repairs the
+published images in the meantime.
 
 ---
 

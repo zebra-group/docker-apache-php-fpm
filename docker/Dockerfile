@@ -38,6 +38,16 @@ LABEL org.opencontainers.image.source="https://github.com/zebra-group/docker-apa
 # 231 MB locales-all package instead.
 COPY docker/locale.gen /etc/locale.gen
 
+# Never read — its only job is to key the layer below. BuildKit caches a RUN on
+# its instruction text plus the ARGs in scope, so with a warm cache apt-get
+# never re-runs and Debian security updates stay out of the image. CI passes a
+# fingerprint of the Debian package indices (.github/scripts/
+# apt-index-fingerprint.sh), so this layer rebuilds exactly when Debian has
+# published something. Empty for local builds, which then cache as before.
+# Declared before SHELL rather than right above the RUN: hadolint loses track
+# of the bash SHELL across an intervening ARG and lints the heredoc as POSIX sh.
+ARG APT_INDEX_FINGERPRINT=
+
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \

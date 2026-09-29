@@ -20,11 +20,13 @@ on:
     paths:
       - 'docker/**'
       - 'test/**'
+      - '.github/scripts/**'
       - '.github/workflows/build.yml'
   pull_request:
     paths:
       - 'docker/**'
       - 'test/**'
+      - '.github/scripts/**'
       - '.github/workflows/build.yml'
 
 # The default token is read-only for contents; pushing to GHCR needs packages.
@@ -63,7 +65,8 @@ jobs:
             | tar -xJf - --strip-components=1 -C /usr/local/bin \
               "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           shellcheck --version
-          shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh
+          shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh \
+            .github/scripts/apt-index-fingerprint.sh
 
       - name: Lint Dockerfile
         uses: hadolint/hadolint-action@v3.5.0
@@ -151,13 +154,28 @@ jobs:
       # keys the install layer on the instruction text plus the parent layer, so
       # with a warm cache the whole apt-get step is a cache hit and never runs.
       # Debian patches for the packages *we* install (apache2, imagemagick,
-      # ghostscript, libicu, ...) therefore only arrive when the php:*-fpm digest
-      # changes and invalidates the cache.
+      # libheif, ...) would only arrive when the php:*-fpm digest moves.
       #
-      # That covers most cases — the official images are rebuilt for Debian
-      # security updates — but not all, and not promptly. So once a week the
-      # cache is bypassed entirely and every package is reinstalled at its
-      # current version.
+      # So the install layer is additionally keyed on a fingerprint of the
+      # Debian package indices: it rebuilds on the first night after Debian
+      # publishes an update, and stays cached otherwise. Before this, the smoke
+      # test "no upgradable OS packages remain" failed every night between a
+      # mid-week Debian update and the Sunday no-cache run.
+      #
+      # Runs on this job's runner, so the indices are those of this
+      # architecture. Both build steps below must receive the same value, or the
+      # push step misses the cache and builds a different image than was tested.
+      - name: Fingerprint Debian package indices
+        id: apt
+        run: |
+          fp="$(.github/scripts/apt-index-fingerprint.sh "php:${{ matrix.php_version }}-fpm")"
+          echo "fingerprint=${fp}" >> "$GITHUB_OUTPUT"
+          echo "- PHP ${{ matrix.php_version }} ${{ matrix.platform.arch }}: apt index fingerprint \`${fp:0:12}\`" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Safety net on top of the fingerprint: once a week the cache is bypassed
+      # entirely and the image is rebuilt from nothing, in case a change slips
+      # past the fingerprint (e.g. a package repository it does not cover).
       - name: Decide cache strategy
         id: cache
         run: |
@@ -180,6 +198,7 @@ jobs:
           tags: php-fpm-apache:test
           build-args: |
             PHP_VERSION=${{ matrix.php_version }}
+            APT_INDEX_FINGERPRINT=${{ steps.apt.outputs.fingerprint }}
           # Always re-resolve php:<version>-fpm instead of reusing a locally
           # known digest — without this the point of the nightly build is lost.
           pull: true
@@ -231,6 +250,7 @@ jobs:
           platforms: linux/${{ matrix.platform.arch }}
           build-args: |
             PHP_VERSION=${{ matrix.php_version }}
+            APT_INDEX_FINGERPRINT=${{ steps.apt.outputs.fingerprint }}
           # No tags here: the image is addressed by digest and only becomes
           # reachable once the merge job assembles the manifest list.
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
