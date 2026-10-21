@@ -10,16 +10,27 @@ ARG PHP_VERSION=8.4
 
 FROM php:${PHP_VERSION}-fpm
 
-# Pinned so the daily rebuild is reproducible. An unpinned `pecl install` means
-# a new upstream release can break or silently change the image overnight.
+# Pinned so the daily rebuild is reproducible. An unpinned extension means a new
+# upstream release can break or silently change the image overnight.
+#
+# The sources are the upstream GitHub tag archives, not pecl.php.net: pecl.php.net
+# failed the whole build matrix three times in October 2026 (unreachable, then
+# minutes of 504s right after a PHP security release, when the rebuild mattered
+# most). The SHA256 pins also make the download tamper-evident. Bumping a version
+# means updating its SHA256 too:
+#   curl -fsSL https://github.com/<repo>/archive/refs/tags/<tag>.tar.gz | sha256sum
 ARG IMAGICK_VERSION=3.8.1
+ARG IMAGICK_SHA256=b0e9279ddf6e75a8c6b4068e16daec0475427dbca7ce2e144e30a51a88aa5ddc
 ARG APCU_VERSION=5.1.28
+ARG APCU_SHA256=0e60ba9d0fa4021c57a70c071f3d8f71de236275d084e560d5959fec4edd8c32
 ARG REDIS_VERSION=6.3.0
+ARG REDIS_SHA256=cb8f81df1a275599e4f8ddcfec7e1f65ed1953e6f5673649149fd680ebff4cad
 # 3.2.17RC1 rather than the 3.2.16 release: 3.2.16 does not compile on PHP 8.5,
 # which removed ext/standard/php_smart_string.h. The RC builds on every version
 # in the matrix (8.2–8.5) and is the only version that does. Move to 3.2.17 once
 # it is released as stable.
 ARG IGBINARY_VERSION=3.2.17RC1
+ARG IGBINARY_SHA256=d563482bd3f623a08bd38ecab1da69e2f8c0f87a781f8b395dd0a95c9959d6e4
 
 # ImageMagick's Debian policy blocks the PDF/PS coders (historical Ghostscript
 # RCEs). CMSes need PDF *reads* for thumbnails, so we re-enable reading by
@@ -50,6 +61,9 @@ ARG APT_INDEX_FINGERPRINT=
 
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
+# DL3003 (use WORKDIR instead of cd): the cd is inside a subshell in
+# build_extension(), one per extension source tree; WORKDIR cannot express that.
+# hadolint ignore=DL3003
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
 <<'INSTALL'
@@ -132,27 +146,53 @@ docker-php-ext-install -j"$(nproc)" \
     xsl \
     zip
 
-# Downloaded with curl rather than by `pecl install <name>-<version>`, because
-# pecl.php.net is the least reliable host in the build and pecl itself never
-# retries: a single 504 or a minute of "Network is unreachable" failed the whole
-# nightly matrix (2026-10-18, 2026-10-21). curl retries network errors only, so
-# a genuine compile failure below still fails on the first attempt. Installing
-# from the local file also skips pecl's channel lookups, which failed in the same
-# outages with "No releases available for package".
-peclDir=/tmp/pecl
-mkdir -p "${peclDir}"
-for pkg in "igbinary-${IGBINARY_VERSION}" "apcu-${APCU_VERSION}" \
-           "imagick-${IMAGICK_VERSION}" "redis-${REDIS_VERSION}"; do
-    curl -fsSL --retry 10 --retry-delay 30 --retry-all-errors --connect-timeout 20 \
-        -o "${peclDir}/${pkg}.tgz" "https://pecl.php.net/get/${pkg}.tgz"
-done
+# Built with phpize from the GitHub tag archives (see the ARGs at the top for
+# why not pecl.php.net). These archives keep package.xml inside the top-level
+# directory, so `pecl install <file>` cannot read them; phpize + configure +
+# make is exactly what pecl would run. curl retries network errors only, so a
+# genuine compile failure still fails on the first attempt.
+#
+# The one other thing pecl does is the <tasks:replace> step from package.xml:
+# imagick's php_imagick.h ships the placeholder "@PACKAGE_VERSION@", and
+# without the substitution phpversion('imagick') returns that literal string,
+# which breaks version checks in TYPO3, WordPress Site Health and Composer.
+# None of the other three extensions define a replace task.
+extSrc=/tmp/ext-src
+build_extension() {
+    local name="$1" version="$2" url="$3" sha256="$4"
+    shift 4
+    mkdir -p "${extSrc}/${name}"
+    curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 20 \
+        -o "${extSrc}/${name}.tar.gz" "${url}"
+    echo "${sha256}  ${extSrc}/${name}.tar.gz" | sha256sum -c -
+    tar -xzf "${extSrc}/${name}.tar.gz" -C "${extSrc}/${name}" --strip-components=1
+    # grep exits 1 when nothing matches, which pipefail would turn into a failed build.
+    { grep -rlF '@PACKAGE_VERSION@' "${extSrc}/${name}" --include='*.h' --include='*.c' || true; } \
+        | xargs -r sed -i "s/@PACKAGE_VERSION@/${version}/g"
+    (
+        cd "${extSrc}/${name}"
+        phpize
+        ./configure "$@"
+        make -j"$(nproc)"
+        make install
+    )
+}
 
-# igbinary first: redis links against it for its serializer.
-pecl install \
-    "${peclDir}/igbinary-${IGBINARY_VERSION}.tgz" \
-    "${peclDir}/apcu-${APCU_VERSION}.tgz" \
-    "${peclDir}/imagick-${IMAGICK_VERSION}.tgz"
-pecl install --configureoptions 'enable-redis-igbinary="yes"' "${peclDir}/redis-${REDIS_VERSION}.tgz"
+# igbinary first: redis links against it for its serializer, and its
+# `make install` puts the headers redis' configure looks for.
+build_extension igbinary "${IGBINARY_VERSION}" \
+    "https://github.com/igbinary/igbinary/archive/refs/tags/${IGBINARY_VERSION}.tar.gz" \
+    "${IGBINARY_SHA256}"
+build_extension apcu "${APCU_VERSION}" \
+    "https://github.com/krakjoe/apcu/archive/refs/tags/v${APCU_VERSION}.tar.gz" \
+    "${APCU_SHA256}"
+build_extension imagick "${IMAGICK_VERSION}" \
+    "https://github.com/Imagick/imagick/archive/refs/tags/${IMAGICK_VERSION}.tar.gz" \
+    "${IMAGICK_SHA256}"
+build_extension redis "${REDIS_VERSION}" \
+    "https://github.com/phpredis/phpredis/archive/refs/tags/${REDIS_VERSION}.tar.gz" \
+    "${REDIS_SHA256}" \
+    --enable-redis-igbinary
 docker-php-ext-enable apcu igbinary imagick redis
 
 # --- Slimming -------------------------------------------------------------
@@ -229,7 +269,7 @@ command -v convert > /dev/null
 command -v curl > /dev/null
 
 locale-gen
-rm -rf /tmp/pear "${peclDir}" /tmp/loaded-modules.txt /var/log/apache2/* /usr/src/php.tar.xz*
+rm -rf /tmp/pear "${extSrc}" /tmp/loaded-modules.txt /var/log/apache2/* /usr/src/php.tar.xz*
 INSTALL
 
 RUN <<'CONFIGURE'

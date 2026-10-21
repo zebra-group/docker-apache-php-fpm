@@ -265,6 +265,23 @@ done
 # get_loaded_extensions() reports OPcache under its display name, not "opcache".
 assert_contains "extension OPcache present" "${info_json}" '"Zend OPcache"'
 
+# redis is compiled from source with --enable-redis-igbinary. If that flag is
+# lost, redis still loads fine and only the slower PHP serializer is available,
+# so presence alone does not catch it. The constant exists only with igbinary.
+redis_igbinary="$(in_container php -r 'echo defined("Redis::SERIALIZER_IGBINARY") ? "yes" : "no";')"
+assert_eq "redis is built with the igbinary serializer" "yes" "${redis_igbinary}"
+
+# Built from git sources, these extensions skip pecl's package.xml replace step.
+# imagick then reported phpversion() as the literal "@PACKAGE_VERSION@", which
+# breaks version_compare() in TYPO3, WordPress Site Health and Composer.
+for ext in imagick redis apcu igbinary; do
+    ext_version="$(in_container php -r "echo phpversion('${ext}');")"
+    case "${ext_version}" in
+        [0-9]*.[0-9]*) ok "extension ${ext} reports a real version (${ext_version})" ;;
+        *)             bad "extension ${ext} reports a real version" "got '${ext_version}'" ;;
+    esac
+done
+
 assert_contains "expose_php is Off" "${info_json}" '"expose_php":""'
 assert_contains "opcache.save_comments stays enabled (TYPO3/Doctrine)" \
     "${info_json}" '"save_comments":"1"'

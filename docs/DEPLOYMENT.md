@@ -74,15 +74,37 @@ curl http://localhost:8080/healthz     # -> ok
 | Argument | Default | Purpose |
 |---|---|---|
 | `PHP_VERSION` | `8.4` | Base image tag (`php:<version>-fpm`) |
-| `IMAGICK_VERSION` | `3.8.1` | Pinned so a new PECL release cannot break the nightly build |
+| `IMAGICK_VERSION` | `3.8.1` | Pinned so a new upstream release cannot break the nightly build |
 | `APCU_VERSION` | `5.1.28` | " |
 | `REDIS_VERSION` | `6.3.0` | " |
 | `IGBINARY_VERSION` | `3.2.17RC1` | A release candidate on purpose — see below |
+| `<EXT>_SHA256` | per extension | SHA256 of the GitHub tag archive the extension is built from |
 
 `IGBINARY_VERSION` is the one pin that is not a stable release. igbinary 3.2.16
 does not compile on PHP 8.5, which removed `ext/standard/php_smart_string.h`;
 3.2.17RC1 builds across the whole 8.2–8.5 matrix and is currently the only
 version that does. Move it to 3.2.17 once that is released as stable.
+
+**Where the extensions come from.** igbinary, apcu, imagick and redis are built
+with `phpize` from the upstream **GitHub tag archives**, not via `pecl install`.
+pecl.php.net broke the build matrix three times in October 2026 — unreachable on
+the 18th, then minutes of `504 Gateway Timeout` on the 21st, both before and
+right after a critical PHP security release, exactly when a rebuild mattered
+most. Each archive is verified against its pinned `<EXT>_SHA256` before it is
+built. pecl's one extra step, the `<tasks:replace>` in `package.xml`, is
+replicated in the Dockerfile: imagick otherwise reports its version as the
+literal `@PACKAGE_VERSION@` (the smoke test checks this).
+
+**Bumping an extension** therefore means changing two build arguments, the
+version and its hash:
+
+```sh
+curl -fsSL https://github.com/phpredis/phpredis/archive/refs/tags/6.3.1.tar.gz | sha256sum
+```
+
+Repositories and tag formats: `igbinary/igbinary` (`3.2.17RC1`),
+`krakjoe/apcu` (`v5.1.28` — note the `v`), `Imagick/imagick` (`3.8.1`),
+`phpredis/phpredis` (`6.3.0`).
 | `IMAGEMAGICK_ALLOW_PDF` | `true` | Allows ImageMagick to *read* PDF/PS so CMS thumbnail generation works. Debian blocks this by default because of historical Ghostscript RCEs. Set `false` if the application never renders PDF previews. |
 
 ### Why the image is the size it is
@@ -272,10 +294,11 @@ issue when a **fixable** HIGH/CRITICAL appears, closing it again once clean.
 upstream. Without the filter the alert would fire permanently on things nobody
 can act on, and would be ignored within a week.
 
-**Pins.** `pin-drift.yml` compares the PECL versions in the Dockerfile against
-PECL's current stable releases weekly and raises an issue on divergence. It does
-not open a PR, because bumping a pin needs a verified build across the whole PHP
-matrix. Dependabot covers the GitHub Actions versions; it cannot cover the base
+**Pins.** `pin-drift.yml` compares the extension versions in the Dockerfile against
+PECL's current stable releases weekly and raises an issue on divergence. PECL is
+still where these projects announce releases, even though the build no longer
+downloads from it. It does not open a PR, because bumping a pin needs a new
+SHA256 (see §2) and a verified build across the whole PHP matrix. Dependabot covers the GitHub Actions versions; it cannot cover the base
 image (a build argument it cannot resolve, and one that is meant to float) or
 PECL (no such ecosystem).
 
@@ -617,15 +640,17 @@ values. Run `.github/scripts/apt-index-fingerprint.sh php:8.4-fpm` twice locally
 publishes an update. `gh workflow run build.yml -f no_cache=true` repairs the
 published images in the meantime.
 
-**Nightly build fails on `cannot download "pecl/…"` or `No releases available for package`.**
-pecl.php.net was unreachable or answered `504 Gateway Timeout`. Nothing in the
-repository is wrong; the published tags simply stay on the last green build. The
-Dockerfile fetches the PECL tarballs with `curl --retry 10 --retry-delay 30`, so
-it rides out an outage of about five minutes. If a longer one still breaks the
-run, check `curl -I https://pecl.php.net/get/redis-6.3.0.tgz` and re-run the
-failed jobs once it answers `200` (`gh run rerun <run-id> --failed`). The
-"Nightly image build is failing" issue is not closed automatically: close it
-after the next green run.
+**Build fails on `sha256sum: WARNING: 1 computed checksum did NOT match`.**
+The GitHub archive for an extension no longer matches its pinned `<EXT>_SHA256`.
+Either a version was bumped without updating the hash — recompute it as shown in
+§2 — or the upstream tag was moved or rewritten. In the second case, do not just
+take the new hash: check the upstream repository for a force-pushed tag first.
+
+**Build fails with `curl: (22)` while fetching an extension.**
+github.com did not answer after five retries. This is rare from GitHub-hosted
+runners; check [githubstatus.com](https://www.githubstatus.com) and re-run the
+failed jobs (`gh run rerun <run-id> --failed`). The "Nightly image build is
+failing" issue is not closed automatically: close it after the next green run.
 
 ---
 
