@@ -617,6 +617,16 @@ values. Run `.github/scripts/apt-index-fingerprint.sh php:8.4-fpm` twice locally
 publishes an update. `gh workflow run build.yml -f no_cache=true` repairs the
 published images in the meantime.
 
+**Nightly build fails on `cannot download "pecl/…"` or `No releases available for package`.**
+pecl.php.net was unreachable or answered `504 Gateway Timeout`. Nothing in the
+repository is wrong; the published tags simply stay on the last green build. The
+Dockerfile fetches the PECL tarballs with `curl --retry 10 --retry-delay 30`, so
+it rides out an outage of about five minutes. If a longer one still breaks the
+run, check `curl -I https://pecl.php.net/get/redis-6.3.0.tgz` and re-run the
+failed jobs once it answers `200` (`gh run rerun <run-id> --failed`). The
+"Nightly image build is failing" issue is not closed automatically: close it
+after the next green run.
+
 ---
 
 ## 8. Extending the image

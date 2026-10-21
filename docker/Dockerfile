@@ -132,12 +132,27 @@ docker-php-ext-install -j"$(nproc)" \
     xsl \
     zip
 
+# Downloaded with curl rather than by `pecl install <name>-<version>`, because
+# pecl.php.net is the least reliable host in the build and pecl itself never
+# retries: a single 504 or a minute of "Network is unreachable" failed the whole
+# nightly matrix (2026-10-18, 2026-10-21). curl retries network errors only, so
+# a genuine compile failure below still fails on the first attempt. Installing
+# from the local file also skips pecl's channel lookups, which failed in the same
+# outages with "No releases available for package".
+peclDir=/tmp/pecl
+mkdir -p "${peclDir}"
+for pkg in "igbinary-${IGBINARY_VERSION}" "apcu-${APCU_VERSION}" \
+           "imagick-${IMAGICK_VERSION}" "redis-${REDIS_VERSION}"; do
+    curl -fsSL --retry 10 --retry-delay 30 --retry-all-errors --connect-timeout 20 \
+        -o "${peclDir}/${pkg}.tgz" "https://pecl.php.net/get/${pkg}.tgz"
+done
+
 # igbinary first: redis links against it for its serializer.
 pecl install \
-    "igbinary-${IGBINARY_VERSION}" \
-    "apcu-${APCU_VERSION}" \
-    "imagick-${IMAGICK_VERSION}"
-pecl install --configureoptions 'enable-redis-igbinary="yes"' "redis-${REDIS_VERSION}"
+    "${peclDir}/igbinary-${IGBINARY_VERSION}.tgz" \
+    "${peclDir}/apcu-${APCU_VERSION}.tgz" \
+    "${peclDir}/imagick-${IMAGICK_VERSION}.tgz"
+pecl install --configureoptions 'enable-redis-igbinary="yes"' "${peclDir}/redis-${REDIS_VERSION}.tgz"
 docker-php-ext-enable apcu igbinary imagick redis
 
 # --- Slimming -------------------------------------------------------------
@@ -214,7 +229,7 @@ command -v convert > /dev/null
 command -v curl > /dev/null
 
 locale-gen
-rm -rf /tmp/pear /tmp/loaded-modules.txt /var/log/apache2/* /usr/src/php.tar.xz*
+rm -rf /tmp/pear "${peclDir}" /tmp/loaded-modules.txt /var/log/apache2/* /usr/src/php.tar.xz*
 INSTALL
 
 RUN <<'CONFIGURE'
