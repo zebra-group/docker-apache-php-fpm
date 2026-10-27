@@ -181,8 +181,10 @@ lint ──▶ build   (4 versions × 2 architectures = 8 jobs, each on a NATIVE
                      │
                      ▼
          merge   (one job per version)
-         ├─ combine the two digests into one multi-arch manifest per tag
+         ├─ combine the two digests into one multi-arch manifest per tag,
+         │  copying the Dockerfile's OCI labels onto it as index annotations
          └─ verify the published manifest really contains both architectures
+            and carries a description annotation
 ```
 
 Two design points worth keeping:
@@ -202,6 +204,14 @@ Two design points worth keeping:
   contains both `linux/amd64` and `linux/arm64` — a tag that silently lost an
   architecture is worse than a failed build, because consumers only discover it
   at pull time.
+- **Package description comes from index annotations.** For a multi-arch tag,
+  GHCR reads `org.opencontainers.image.description` from the *index* manifest,
+  not from the image labels — with labels alone the package page shows "No
+  description provided". The merge job therefore reads every
+  `org.opencontainers.image.*` label from a built image and passes it to
+  `imagetools create` as `--annotation index:…`. The `LABEL` block in
+  `docker/Dockerfile` stays the only place to change description, title,
+  source or license.
 
 `lint` runs `shellcheck` on the shell scripts and `hadolint` on the Dockerfile.
 

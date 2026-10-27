@@ -334,7 +334,25 @@ jobs:
             exit 1
           fi
 
-          docker buildx imagetools create "${tag_args[@]}" "${source_args[@]}"
+          # GHCR shows the description of a multi-arch tag from the index's
+          # annotations, not from the per-architecture image labels, so the
+          # package page read "No description provided". Copy the OCI labels
+          # the Dockerfile sets onto the index, keeping the Dockerfile the
+          # single source of truth. A push-by-digest source is itself an index
+          # (image + attestations), hence the map-or-object handling.
+          annotation_args=()
+          while IFS= read -r annotation; do
+            annotation_args+=(--annotation "${annotation}")
+          done < <(
+            docker buildx imagetools inspect "${source_args[0]}" --format '{{json .Image}}' \
+              | jq -r '(if has("config") then . else first(.[]) end)
+                       | .config.Labels // {} | to_entries[]
+                       | select(.key | startswith("org.opencontainers.image."))
+                       | "index:\(.key)=\(.value)"'
+          )
+
+          docker buildx imagetools create \
+            "${tag_args[@]}" "${annotation_args[@]}" "${source_args[@]}"
 
       - name: Verify the published manifest
         run: |
@@ -358,6 +376,14 @@ jobs:
               || { echo "Published manifest is missing linux/${arch}" >&2; exit 1; }
             echo "ok: linux/${arch} present"
           done
+
+          # Without this the GHCR package page silently falls back to
+          # "No description provided" again.
+          printf '%s' "${raw}" \
+            | jq -e '.annotations["org.opencontainers.image.description"] // "" | length > 0' \
+                > /dev/null \
+            || { echo "Published index has no org.opencontainers.image.description annotation" >&2; exit 1; }
+          echo "ok: index description annotation present"
 
           {
             echo "### PHP ${{ matrix.php_version }} published"
