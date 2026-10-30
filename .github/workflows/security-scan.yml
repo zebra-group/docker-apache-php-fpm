@@ -41,17 +41,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Same pinned Trivy as the build-time scan in build.yml, so both scans
+      # judge with the same version. Keep the two in sync.
       - name: Install Trivy
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget gnupg
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
-            | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
-          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] \
-            https://aquasecurity.github.io/trivy-repo/deb generic main" \
-            | sudo tee /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+        with:
+          version: v0.70.0
+          cache: true
 
       # Fetched once up front with retries and a fallback registry; the scans
       # below then run with --skip-db-update. Without this a DB outage made
@@ -60,9 +56,7 @@ jobs:
       - name: Download Trivy vulnerability DB
         run: .github/scripts/trivy-db-download.sh "${HOME}/.cache/trivy"
 
-      # Kept in sync with matrix.php_version in build.yml by hand — there are
-      # only ever a handful of supported versions, and wiring a shared matrix
-      # between workflows costs more than it saves.
+      # The same version list build.yml builds from.
       - name: Scan every published tag
         id: scan
         run: |
@@ -71,7 +65,8 @@ jobs:
           findings=0
           errors=0
 
-          for version in 8.2 8.3 8.4 8.5; do
+          mapfile -t versions < <(jq -r '.[]' .github/php-versions.json)
+          for version in "${versions[@]}"; do
             ref="${IMAGE_NAME}:${version}"
             echo "::group::Scanning ${ref}"
 

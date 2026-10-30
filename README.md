@@ -20,8 +20,7 @@ docker run -d -p 8080:80 -v "$(pwd)/html:/var/www/html" \
 | Tag | |
 |---|---|
 | `8.2` `8.3` `8.4` `8.5` | Rolling, rebuilt nightly |
-| `8.4-20260803` | Immutable date snapshot — **pin this in production** |
-| `8.4-a1b2c3d` | Immutable commit snapshot |
+| `8.4-20260803` | Date snapshot (last build of that day) — pin this, or its digest, in production |
 | `latest` | Currently 8.4 |
 
 PHP 8.0 and 8.1 are no longer built (end of life, no upstream security patches).
@@ -138,8 +137,8 @@ Add one alongside any behavioural change; CI runs the suite before pushing.
 `linux/amd64` and `linux/arm64` on **native runners** — smoke-testing and
 Trivy-scanning both — and assembles the multi-arch manifest in a separate merge
 job, with SBOM and provenance. Tags are only created after both architectures
-succeed. The `matrix.php_version` list is the single source of truth for which
-tags get built.
+succeed. `.github/php-versions.json` is the single source of truth for which
+tags get built (and scanned).
 
 Keeping the image current is deliberately split across four mechanisms, because a
 nightly rebuild alone is a no-op whenever the layer cache is warm:

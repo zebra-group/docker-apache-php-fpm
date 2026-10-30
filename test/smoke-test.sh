@@ -209,6 +209,9 @@ assert_not_contains "no undefined Apache config variables" "${startup_logs}" "is
 assert_not_contains "no Apache config warnings at startup" "${startup_logs}" "AH00117"
 assert_not_contains "MaxRequestWorkers is a multiple of ThreadsPerChild" \
     "${startup_logs}" "MaxRequestWorkers of"
+# Without a limit the pool used to be sized from host RAM in silence.
+assert_contains "missing memory limit is warned about" \
+    "${startup_logs}" "no container memory limit found"
 
 # =============================================================================
 bold "==> Caching headers (the 1-year-cache-on-PHP defect)"
@@ -238,6 +241,17 @@ echo "app-controlled caching";
 PHP
 app_cc="$(curl -sSI "${BASE}/cacheable.php" | tr '[:upper:]' '[:lower:]' | grep -i '^cache-control' || echo '')"
 assert_contains "application Cache-Control is not overridden" "${app_cc}" "max-age=600"
+
+# mod_expires' ExpiresByType keyed on the MIME type and gave PHP-generated
+# images a shared-cacheable 30-day max-age, beating the private default.
+cat > "${WORKDIR}/html/image.php" <<'PHP'
+<?php
+header('Content-Type: image/png');
+echo "not really a png";
+PHP
+php_img_cc="$(curl -sSI "${BASE}/image.php" | tr '[:upper:]' '[:lower:]' | grep -i '^cache-control' || echo '')"
+assert_not_contains "PHP-generated image gets no max-age" "${php_img_cc}" "max-age"
+assert_contains "PHP-generated image is private" "${php_img_cc}" "private"
 
 # =============================================================================
 bold "==> Information disclosure"
@@ -416,17 +430,33 @@ fi
 bold "==> Graceful shutdown"
 # =============================================================================
 
+# One worker, so the second and third request queue on the FPM socket. Apache
+# and FPM used to be stopped at the same time, and FPM dropped the queued
+# requests: Apache answered them with 503 on every deploy under load.
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 docker run -d --name "${CONTAINER}" -p "${PORT}:80" \
-    -v "${WORKDIR}/html:/var/www/html" "${IMAGE}" >/dev/null
+    -v "${WORKDIR}/html:/var/www/html" \
+    -e PHP_FPM_MAX_CHILDREN=1 -e PHP_FPM_PM=static \
+    "${IMAGE}" >/dev/null
 for _ in $(seq 1 60); do
     curl -fsS --max-time 2 "${BASE}/index.php" >/dev/null 2>&1 && break
     sleep 0.5
 done
 
+inflight_pids=()
+for n in 1 2 3; do
+    curl -s -o /dev/null -w '%{http_code}' --max-time 30 "${BASE}/slow.php?s=3" \
+        > "${WORKDIR}/inflight-${n}" &
+    inflight_pids+=("$!")
+done
+sleep 1
+
 stop_start="$(date +%s)"
 docker stop -t 30 "${CONTAINER}" >/dev/null
 stop_elapsed=$(( $(date +%s) - stop_start ))
+wait "${inflight_pids[@]}"
+assert_eq "requests in flight and queued complete during shutdown" "200 200 200" \
+    "$(cat "${WORKDIR}/inflight-1") $(cat "${WORKDIR}/inflight-2") $(cat "${WORKDIR}/inflight-3")"
 # A container that ignores SIGTERM is killed at the 30s timeout instead.
 if [ "${stop_elapsed}" -lt 20 ]; then
     ok "responds to SIGTERM promptly (${stop_elapsed}s)"
@@ -434,7 +464,8 @@ else
     bad "responds to SIGTERM promptly" "took ${stop_elapsed}s — signals likely not forwarded"
 fi
 
-shutdown_logs="$(docker logs "${CONTAINER}" 2>&1 | tail -5)"
+# Whole log, not the tail: the requests drained above are logged after it.
+shutdown_logs="$(docker logs "${CONTAINER}" 2>&1)"
 assert_contains "shutdown is logged by the entrypoint" "${shutdown_logs}" "shutting down"
 
 # =============================================================================
@@ -471,6 +502,20 @@ assert_contains "APACHE_ASSET_CACHE_MAX_AGE honoured" "${tuned_css}" "max-age=99
 tuned_logs="$(docker logs "${CONTAINER}" 2>&1)"
 assert_contains "Apache sizing derived from ENV" "${tuned_logs}" "4 x 16"
 assert_not_contains "no MPM sizing warning" "${tuned_logs}" "MaxRequestWorkers of"
+
+# Worker count derived from the container memory limit:
+# (1024 - 256 opcache - 192 reserved) / 96 per worker = 6.
+docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+docker run -d --name "${CONTAINER}" --memory 1g "${IMAGE}" >/dev/null
+sized_fpm=""
+for _ in $(seq 1 20); do
+    sized_fpm="$(in_container cat /usr/local/etc/php-fpm.d/zz-runtime.conf 2>/dev/null || true)"
+    [ -n "${sized_fpm}" ] && break
+    sleep 0.5
+done
+assert_contains "pm.max_children derived from the memory limit" "${sized_fpm}" "pm.max_children = 6"
+assert_not_contains "memory limit is detected" "$(docker logs "${CONTAINER}" 2>&1)" \
+    "no container memory limit found"
 
 # mod_remoteip must refuse to trust forwarded headers without a trusted proxy.
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true

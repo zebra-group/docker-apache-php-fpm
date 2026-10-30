@@ -40,12 +40,22 @@ Images go to `ghcr.io/zebra-group/php-fpm-apache`:
 | Tag | Meaning |
 |---|---|
 | `8.2` `8.3` `8.4` `8.5` | Rolling — rebuilt daily, moves |
-| `8.4-20260803` | Immutable date snapshot — use this to pin or roll back |
-| `8.4-a1b2c3d` | Immutable commit snapshot |
+| `8.4-20260803` | Date snapshot — the last build of that UTC day; use this to roll back |
 | `latest` | Alias for the version in `LATEST_PHP` (currently 8.4) |
 
-**Pin an immutable tag in production.** The rolling tags move every night; if a
-daily rebuild ever ships a regression, a date tag is what you roll back to.
+**Pin in production.** The rolling tags move every night; if a daily rebuild
+ever ships a regression, a date tag is what you roll back to. A date tag can
+still move once more on its own day (a push or a re-run after the nightly
+build), so for a pin that never moves use the digest:
+`ghcr.io/zebra-group/php-fpm-apache:8.4-20260803@sha256:<digest>` (shown by
+`docker buildx imagetools inspect <tag>`).
+
+There is no commit tag (`8.4-<sha>`) any more: the nightly rebuild re-pointed it
+every night as long as no new commit landed, so it was never a pin.
+
+**Which PHP versions get built** is listed once, in `.github/php-versions.json`.
+`build.yml` (build and merge jobs) and `security-scan.yml` both read it — adding
+or dropping a version is a one-line change there.
 
 PHP 8.0 and 8.1 are **no longer built** — both are end-of-life and their base
 images receive no security patches. The old tags remain in the registry but are
@@ -325,7 +335,9 @@ upstream. Without the filter the alert would fire permanently on things nobody
 can act on, and would be ignored within a week.
 
 **Pins.** `pin-drift.yml` compares the extension versions in the Dockerfile against
-PECL's current stable releases weekly and raises an issue on divergence. PECL is
+PECL's current stable releases weekly and raises an issue on divergence. If
+PECL cannot be reached for any extension the run fails (and is retried, see
+below) instead of closing the issue as if every pin were current. PECL is
 still where these projects announce releases, even though the build no longer
 downloads from it. It does not open a PR, because bumping a pin needs a new
 SHA256 (see §2) and a verified build across the whole PHP matrix. Dependabot covers the GitHub Actions versions; it cannot cover the base
@@ -466,7 +478,6 @@ those are generated.
 | `APACHE_MAX_CONNECTIONS_PER_CHILD` | `0` | `0` = never recycle. PHP is out-of-process, so recycling only costs restarts. |
 | `APACHE_ALLOW_OVERRIDE` | `All` | `None` removes a `stat()` per directory level per request — only once `.htaccess` rules are baked into `conf.d/`. |
 | `APACHE_ASSET_CACHE_MAX_AGE` | `2592000` | Seconds, static assets (30 days). |
-| `APACHE_ASSET_CACHE_TIME` | `30 days` | `mod_expires` equivalent of the above; keep the two in sync. |
 | `APACHE_BROTLI` | `On` | |
 | `APACHE_BROTLI_QUALITY` | `5` | 1–11. Above ~6 costs more CPU than it saves bandwidth for dynamic output. |
 | `APACHE_DEFLATE_LEVEL` | `6` | |
@@ -519,6 +530,12 @@ children = (memory_limit − PHP_OPCACHE_MEMORY − RESERVED_MEMORY_MB) / PHP_FP
 
 The computed value is logged at startup. Set it explicitly in production so
 capacity does not change when you resize the container.
+
+**Without a container memory limit** (plain `docker run` / Compose without
+`mem_limit`) the host's total RAM is used instead, and the entrypoint logs
+`WARNING: no container memory limit found`. With several containers on one
+host every one of them then sizes itself for the whole machine — set a memory
+limit or `PHP_FPM_MAX_CHILDREN` in that case.
 
 ### Sizing for ~3.5 million pageviews/month
 
@@ -688,9 +705,15 @@ points at `/usr/bin/`.
 File-based sessions in `/tmp`, plus more than one replica. Switch to Redis.
 
 **`docker stop` takes 30 seconds.**
-Signals are not reaching the processes. The entrypoint traps `TERM` and sends
-Apache `SIGWINCH` (graceful stop) and FPM `SIGQUIT`; shutdown should take about a
-second on an idle container. If it does not, check that `tini` is still PID 1.
+Signals are not reaching the processes. The entrypoint traps `TERM`, sends
+Apache `SIGWINCH` (graceful stop), waits up to 20 s for Apache to finish its
+in-flight requests, and only then sends FPM `SIGQUIT` (5 s more before both are
+killed). The order matters: stopping FPM first dropped the requests still
+queued on its socket, which Apache answered with 503 on every deploy under
+load. Shutdown should take about a second on an idle container; give the
+orchestrator at least 25 s (`docker stop -t 30`, `stop_grace_period: 30s`,
+Kubernetes' default 30 s is fine). If an idle container still takes long,
+check that `tini` is still PID 1.
 
 **Nightly build fails on "no upgradable OS packages remain after build".**
 The install layer came from the cache although Debian has newer packages. Check

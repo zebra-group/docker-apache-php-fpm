@@ -21,12 +21,14 @@ on:
       - 'docker/**'
       - 'test/**'
       - '.github/scripts/**'
+      - '.github/php-versions.json'
       - '.github/workflows/build.yml'
   pull_request:
     paths:
       - 'docker/**'
       - 'test/**'
       - '.github/scripts/**'
+      - '.github/php-versions.json'
       - '.github/workflows/build.yml'
 
 # The default token is read-only for contents; pushing to GHCR needs packages.
@@ -48,8 +50,17 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    outputs:
+      php_versions: ${{ steps.versions.outputs.php_versions }}
     steps:
       - uses: actions/checkout@v7
+
+      # .github/php-versions.json is the single list of built PHP versions:
+      # build and merge read it from here, security-scan.yml reads the file.
+      # Two hand-synced copies once let a version be built but never tagged.
+      - name: Read PHP versions
+        id: versions
+        run: echo "php_versions=$(jq -c . .github/php-versions.json)" >> "$GITHUB_OUTPUT"
 
       # Pinned rather than `apt-get install shellcheck`: the Ubuntu archive
       # version drifts from whatever developers run locally, and the two disagree
@@ -130,11 +141,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 8.0 and 8.1 were dropped: both are end-of-life, so their base images
-        # no longer receive security patches. Existing tags stay in the registry
-        # but are no longer rebuilt. Keep this list in sync with the version loop
-        # in security-scan.yml.
-        php_version: ['8.2', '8.3', '8.4', '8.5']
+        # From .github/php-versions.json. 8.0 and 8.1 were dropped: both are
+        # end-of-life, so their base images no longer receive security patches.
+        # Existing tags stay in the registry but are no longer rebuilt.
+        php_version: ${{ fromJSON(needs.lint.outputs.php_versions) }}
         platform:
           - arch: amd64
             runner: ubuntu-latest
@@ -306,13 +316,13 @@ jobs:
   # architectures.
   merge:
     name: Publish PHP ${{ matrix.php_version }}
-    needs: build
+    needs: [lint, build]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        php_version: ['8.2', '8.3', '8.4', '8.5']
+        php_version: ${{ fromJSON(needs.lint.outputs.php_versions) }}
     steps:
       - name: Download digests for this version
         uses: actions/download-artifact@v8
@@ -339,10 +349,11 @@ jobs:
           date_tag="$(date -u +%Y%m%d)"
           tags=(
             "${IMAGE_NAME}:${{ matrix.php_version }}"
-            # Immutable tags so a broken daily build can be rolled back to. The
-            # rolling :<version> tag alone left no previous image to return to.
+            # Dated snapshot so a broken daily build can be rolled back to. It
+            # is the last build of that UTC day, so a second build the same day
+            # moves it; only a digest is truly immutable. There is no -<sha>
+            # tag on purpose: the nightly rebuild moved it every night.
             "${IMAGE_NAME}:${{ matrix.php_version }}-${date_tag}"
-            "${IMAGE_NAME}:${{ matrix.php_version }}-${GITHUB_SHA::7}"
           )
           if [ "${{ matrix.php_version }}" = "${LATEST_PHP}" ]; then
             tags+=("${IMAGE_NAME}:latest")

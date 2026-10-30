@@ -32,6 +32,7 @@ jobs:
           set -uo pipefail
           : > drift.md
           drift=0
+          unreachable=0
 
           for ext in imagick apcu redis igbinary; do
             arg="$(printf '%s' "${ext}" | tr '[:lower:]' '[:upper:]')_VERSION"
@@ -46,6 +47,7 @@ jobs:
                       "https://pecl.php.net/rest/r/${ext}/stable.txt" || echo '')"
             if [ -z "${latest}" ]; then
               echo "- \`${ext}\`: could not reach PECL (pinned \`${pinned}\`)" >> drift.md
+              unreachable=$(( unreachable + 1 ))
               continue
             fi
 
@@ -71,8 +73,17 @@ jobs:
           echo "drift=${drift}" >> "$GITHUB_OUTPUT"
           cat drift.md >> "$GITHUB_STEP_SUMMARY" || true
 
+          # An unchecked pin is not a current pin: failing keeps the close step
+          # from reporting "all current", and retry-scheduled.yml re-runs it.
+          if [ "${unreachable}" -gt 0 ]; then
+            echo "::error::${unreachable} extension(s) could not be checked against PECL" >&2
+            exit 1
+          fi
+
+      # always(): drift found for the reachable extensions is still reported
+      # when another one could not be checked.
       - name: Open or update an issue
-        if: steps.compare.outputs.drift != '0'
+        if: always() && steps.compare.outputs.drift != '' && steps.compare.outputs.drift != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
