@@ -1,0 +1,111 @@
+name: Retry failed scheduled runs
+
+# GitHub Actions has no job-level retry, and most nightly failures are not in
+# the code: a registry returning 404 for a few minutes, a runner losing its
+# network. One such blip in one matrix job used to skip the whole merge and
+# publish nothing that night (30.10.2026, a Trivy DB download).
+#
+# So a failed scheduled run gets its failed jobs re-run — together with the jobs
+# that depend on them, e.g. the merge — before anyone is told. Only when the
+# last attempt fails too is an issue opened. Real defects therefore surface
+# about RETRY_DELAY × attempts later than before, which is the price of not
+# waking anyone for a transient one.
+#
+# workflow_run only fires for workflows on the default branch, so changes to
+# this file take effect once merged.
+
+on:
+  workflow_run:
+    # Matched by the workflows' `name:` — keep in sync when renaming one.
+    workflows:
+      - Build PHP-Apache Images
+      - Scan published images
+      - Check PECL pin drift
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+jobs:
+  retry:
+    name: Retry or escalate
+    # Started by the first attempt only. Later attempts are watched by this same
+    # job, so their own completion events must not start a second retry chain.
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt == 1 &&
+      (github.event.workflow_run.event == 'schedule' ||
+       github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    # A Sunday no-cache build takes the longest; three of them plus the delays
+    # stay well inside this.
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+      # Total attempts including the original run.
+      MAX_ATTEMPTS: 3
+      # Seconds before each re-run — long enough for a registry blip to clear.
+      RETRY_DELAY: 300
+    steps:
+      - name: Re-run failed jobs
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 2 "${MAX_ATTEMPTS}"); do
+            sleep "${RETRY_DELAY}"
+            echo "Re-running failed jobs of ${RUN_URL} (attempt ${attempt}/${MAX_ATTEMPTS})"
+            gh run rerun "${RUN_ID}" --failed
+
+            # rerun returns before the new attempt is registered, so wait until
+            # the run reports this attempt number *and* is completed again.
+            # A failed lookup reads as attempt 0 and is simply polled again.
+            while :; do
+              sleep 60
+              got=0 status="" conclusion=""
+              read -r got status conclusion < <(
+                gh run view "${RUN_ID}" --json attempt,status,conclusion \
+                  --jq '"\(.attempt) \(.status) \(.conclusion)"' || true
+              ) || true
+              if [ "${got:-0}" -ge "${attempt}" ] && [ "${status:-}" = "completed" ]; then
+                break
+              fi
+            done
+
+            echo "- attempt ${attempt}: ${conclusion:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${conclusion:-}" = "success" ]; then
+              exit 0
+            fi
+          done
+          echo "All ${MAX_ATTEMPTS} attempts of ${WORKFLOW_NAME} failed." >&2
+          exit 1
+
+      # Runs when the last attempt failed, and also when this job itself broke
+      # (e.g. the re-run was refused) — either way nobody would hear otherwise.
+      - name: Open or update an issue
+        if: failure()
+        run: |
+          title="Scheduled run failing: ${WORKFLOW_NAME}"
+          gh label create build-failure --color B60205 \
+            --description "Automated build or test failure" 2>/dev/null || true
+
+          body="**${WORKFLOW_NAME}** failed on all ${MAX_ATTEMPTS} attempts,
+          so this is unlikely to be a transient outage.
+
+          Run: ${RUN_URL}
+
+          If this is the image build: until it is fixed the published tags are
+          **stale** — they still point at the last successful build, so nothing
+          is broken for consumers, but security updates are no longer arriving."
+
+          existing="$(gh issue list --state open --search "in:title \"${title}\"" \
+                       --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body "${body}"
+          else
+            gh issue create --title "${title}" --label build-failure --body "${body}"
+          fi

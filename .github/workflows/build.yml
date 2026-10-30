@@ -66,7 +66,11 @@ jobs:
               "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           shellcheck --version
           shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh \
-            .github/scripts/apt-index-fingerprint.sh
+            .github/scripts/apt-index-fingerprint.sh .github/scripts/trivy-db-download.sh \
+            test/trivy-db-download-test.sh
+
+      - name: Test CI scripts
+        run: test/trivy-db-download-test.sh
 
       - name: Lint Dockerfile
         uses: hadolint/hadolint-action@v3.5.0
@@ -219,9 +223,30 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
       # --- Stage 2: scan -----------------------------------------------------
+      # Trivy is installed and its DB fetched in separate steps so the DB
+      # download can be retried and fall back to a second registry — see the
+      # script for the outage that made this necessary. The scan itself then
+      # runs offline against that DB.
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+        with:
+          version: v0.70.0
+          cache: true
+
+      - name: Download Trivy vulnerability DB
+        run: .github/scripts/trivy-db-download.sh "${{ github.workspace }}/.cache/trivy"
+
       - name: Scan for vulnerabilities
         uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_SKIP_DB_UPDATE: 'true'
         with:
+          skip-setup-trivy: true
+          # The action's own cache would restore an older DB over the one just
+          # downloaded; cache-dir is the action's default, spelled out because
+          # the download step above writes there.
+          cache: false
+          cache-dir: ${{ github.workspace }}/.cache/trivy
           image-ref: php-fpm-apache:test
           format: table
           # Only fail on criticals that actually have a fix available —
@@ -393,40 +418,5 @@ jobs:
             echo "- built from \`php:${{ matrix.php_version }}-fpm@${base}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # A scheduled build that fails silently is worse than no scheduled build. This
-  # raises a GitHub issue so the failure is visible without anyone watching the
-  # Actions tab. Only for automated runs — a failing PR is already visible.
-  notify-failure:
-    name: Report nightly failure
-    needs: [lint, build, merge]
-    if: failure() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - name: Open or update an issue
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          title="Nightly image build is failing"
-          gh label create build-failure --color B60205 \
-            --description "Automated build or test failure" 2>/dev/null || true
-
-          body="The scheduled build failed.
-
-          Run: ${RUN_URL}
-
-          Until this is fixed the published tags are **stale** — they still point
-          at the last successful build, so nothing is broken for consumers, but
-          security updates are no longer arriving."
-
-          existing="$(gh issue list --state open --search "in:title \"${title}\"" \
-                       --json number --jq '.[0].number // empty')"
-          if [ -n "${existing}" ]; then
-            gh issue comment "${existing}" --body "${body}"
-          else
-            gh issue create --title "${title}" --label build-failure --body "${body}"
-          fi
+# Failure reporting lives in retry-scheduled.yml: a failed scheduled run is
+# re-run there first, and an issue is only opened once every attempt failed.

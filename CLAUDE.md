@@ -27,18 +27,21 @@ test/smoke-test.sh php-fpm-apache:local
 Lint before committing (CI does the same):
 
 ```sh
-shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh .github/scripts/apt-index-fingerprint.sh
+shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh .github/scripts/*.sh test/trivy-db-download-test.sh
+test/trivy-db-download-test.sh   # unit tests for the CI helper scripts, stubbed trivy, no network
 ```
 
 ## CI / Release
 
-Four workflows, each answering a different question — see `docs/DEPLOYMENT.md` §3a for the full reasoning.
+Five workflows, each answering a different question — see `docs/DEPLOYMENT.md` §3a for the full reasoning.
 
-`.github/workflows/build.yml` runs daily (cron), on manual dispatch, and on push/PR touching `docker/`, `test/`, `.github/scripts/` or the workflow. Pipeline: `lint` (shellcheck + hadolint) → `build` as 4 versions × 2 architectures on **native runners** (`ubuntu-latest` / `ubuntu-24.04-arm`, no QEMU), each building, smoke-testing, Trivy-scanning and pushing by digest → `merge` assembling one multi-arch manifest per tag. A `notify-failure` job opens an issue when a scheduled run fails.
+`.github/workflows/build.yml` runs daily (cron), on manual dispatch, and on push/PR touching `docker/`, `test/`, `.github/scripts/` or the workflow. Pipeline: `lint` (shellcheck + hadolint + unit tests of the CI scripts) → `build` as 4 versions × 2 architectures on **native runners** (`ubuntu-latest` / `ubuntu-24.04-arm`, no QEMU), each building, smoke-testing, Trivy-scanning and pushing by digest → `merge` assembling one multi-arch manifest per tag. The Trivy DB is fetched before the scan by `.github/scripts/trivy-db-download.sh` (retries, falls back from `mirror.gcr.io` to `ghcr.io`), and the scan runs with `TRIVY_SKIP_DB_UPDATE=true`: a single DB 404 used to fail one matrix job, which skips every `merge` job and publishes nothing.
+
+`retry-scheduled.yml` re-runs the failed jobs of a failed scheduled/dispatched run of `build.yml`, `security-scan.yml` or `pin-drift.yml` (3 attempts in total, 5 min apart) and only then opens a `Scheduled run failing: <workflow>` issue. It matches workflows by `name:`, so renaming one means updating its list.
 
 Tags are created **only** in the merge job, so a tag can never reference a half-built set of architectures; the merge job then asserts both architectures are present in what it published. Native runners also mean arm64 is finally smoke-tested — under QEMU it could only be built, since a multi-platform image cannot be loaded into the local daemon. arm64 runners are free because this repo is public; if it ever goes private they become a paid feature and unavailable labels cause jobs to **queue rather than fail**.
 
-`security-scan.yml` scans the *published* registry tags daily and files an issue on fixable HIGH/CRITICAL findings. `pin-drift.yml` checks the PECL pins against upstream weekly. `dependabot.yml` covers action versions.
+`security-scan.yml` scans the *published* registry tags daily and files an issue on fixable HIGH/CRITICAL findings; a tag it cannot scan fails the run instead of counting as clean. `pin-drift.yml` checks the PECL pins against upstream weekly. `dependabot.yml` covers action versions.
 
 - `matrix.php_version` is the single source of truth for which tags get built. PHP 8.0/8.1 were dropped as EOL; adding a version means adding it there **and** in the version loop in `security-scan.yml`.
 - Tags per build: rolling `:<version>`, immutable `:<version>-<date>` and `:<version>-<sha>`, plus `:latest` for whichever version `LATEST_PHP` names.

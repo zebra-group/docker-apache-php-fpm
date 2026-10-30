@@ -53,6 +53,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y trivy
 
+      # Fetched once up front with retries and a fallback registry; the scans
+      # below then run with --skip-db-update. Without this a DB outage made
+      # every tag "unscannable", which counted as zero findings and closed the
+      # vulnerability issue as if the images were clean.
+      - name: Download Trivy vulnerability DB
+        run: .github/scripts/trivy-db-download.sh "${HOME}/.cache/trivy"
+
       # Kept in sync with matrix.php_version in build.yml by hand — there are
       # only ever a handful of supported versions, and wiring a shared matrix
       # between workflows costs more than it saves.
@@ -62,6 +69,7 @@ jobs:
           set -uo pipefail
           : > report.md
           findings=0
+          errors=0
 
           for version in 8.2 8.3 8.4 8.5; do
             ref="${IMAGE_NAME}:${version}"
@@ -69,10 +77,12 @@ jobs:
 
             # --ignore-unfixed: an upstream CVE with no available patch is not
             # actionable here and would make this alert permanently noisy.
-            if ! trivy image --quiet --scanners vuln \
+            if ! trivy image --quiet --scanners vuln --skip-db-update \
+                 --cache-dir "${HOME}/.cache/trivy" \
                  --severity HIGH,CRITICAL --ignore-unfixed \
                  --format json --output "scan-${version}.json" "${ref}"; then
               echo "Trivy could not scan ${ref} (tag missing?)" >> report.md
+              errors=$(( errors + 1 ))
               echo "::endgroup::"
               continue
             fi
@@ -100,8 +110,18 @@ jobs:
           echo "findings=${findings}" >> "$GITHUB_OUTPUT"
           cat report.md >> "$GITHUB_STEP_SUMMARY" || true
 
+          # An unscanned tag is not a clean tag. Failing here keeps the
+          # "close when clean" step from running, and a failed scheduled run is
+          # retried and escalated by retry-scheduled.yml.
+          if [ "${errors}" -gt 0 ]; then
+            echo "::error::${errors} tag(s) could not be scanned" >&2
+            exit 1
+          fi
+
+      # always(): findings in the tags that *could* be scanned must still be
+      # reported when another tag failed to scan.
       - name: Open or update an issue
-        if: steps.scan.outputs.findings != '0'
+        if: always() && steps.scan.outputs.findings != '' && steps.scan.outputs.findings != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

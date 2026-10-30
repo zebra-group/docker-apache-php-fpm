@@ -159,6 +159,10 @@ behavioural. Every assertion in `test/smoke-test.sh` corresponds to a defect thi
 image actually had, and exists so it cannot return unnoticed. CI runs the suite
 against a freshly built image **before** anything is pushed.
 
+The CI helper scripts in `.github/scripts/` are not part of the image and get
+plain unit tests instead, e.g. `test/trivy-db-download-test.sh` (runs against a
+stub `trivy`, needs neither Docker nor network). The `lint` job runs them.
+
 ---
 
 ## 3. CI/CD
@@ -166,7 +170,7 @@ against a freshly built image **before** anything is pushed.
 `.github/workflows/build.yml`.
 
 **Triggers:** daily at 00:00 UTC, on manual dispatch, and on push/PR touching
-`docker/`, `test/` or the workflow.
+`docker/`, `test/`, `.github/scripts/` or the workflow.
 
 **Pipeline:**
 
@@ -176,7 +180,8 @@ lint ──▶ build   (4 versions × 2 architectures = 8 jobs, each on a NATIVE
          │
          ├─ 1. build for this architecture, load into the local daemon
          ├─ 2. run test/smoke-test.sh        ← blocks publication if it fails
-         ├─ 3. Trivy scan (fails on fixable CRITICAL)
+         ├─ 3. Trivy scan (fails on fixable CRITICAL); the DB is fetched
+         │     first with retries and a fallback registry, see below
          └─ 4. push an untagged, digest-addressed image
                      │
                      ▼
@@ -213,7 +218,22 @@ Two design points worth keeping:
   `docker/Dockerfile` stays the only place to change description, title,
   source or license.
 
-`lint` runs `shellcheck` on the shell scripts and `hadolint` on the Dockerfile.
+- **The Trivy DB is downloaded separately, with retries.** Trivy fetches its
+  vulnerability DB on every scan, and a failed fetch aborts the scan before the
+  image is even looked at. On 30.10.2026 a single 404 from `mirror.gcr.io` failed
+  one of the eight build jobs; since `merge` needs the whole matrix, **no tag
+  was published that night**, for any version. Trivy's built-in
+  `--db-repository` fallback did not help, because it only switches registry on
+  errors it classes as temporary — a 404 is not one.
+  `.github/scripts/trivy-db-download.sh` therefore fetches the DB up front: up
+  to three rounds over `mirror.gcr.io/aquasec/trivy-db:2` and
+  `ghcr.io/aquasecurity/trivy-db:2`, with growing pauses in between. The scan
+  then runs with `TRIVY_SKIP_DB_UPDATE=true` and the trivy-action's own cache
+  disabled, since restoring that cache would overwrite the fresh DB with an
+  older one. `security-scan.yml` uses the same script.
+
+`lint` runs `shellcheck` on the shell scripts, `hadolint` on the Dockerfile, and
+the unit tests of the CI scripts.
 
 **Secrets:** none to configure. The workflow uses the automatically provided
 `GITHUB_TOKEN` with `packages: write`, declared explicitly in the `permissions`
@@ -312,10 +332,43 @@ SHA256 (see §2) and a verified build across the whole PHP matrix. Dependabot co
 image (a build argument it cannot resolve, and one that is meant to float) or
 PECL (no such ecosystem).
 
-**Failure is visible.** A `notify-failure` job opens an issue when a scheduled
-run fails. Note what a failed build means: nothing is broken for consumers, since
-the previous tags stay published — but security updates have silently stopped
+**Failures are retried, then made visible (`retry-scheduled.yml`).** GitHub
+Actions has no job-level retry, and most nightly failures are not in the code —
+a registry answering 404 for a few minutes, a runner losing its network. So
+when a scheduled (or manually dispatched) run of `build.yml`,
+`security-scan.yml` or `pin-drift.yml` fails, this workflow waits 5 minutes and
+re-runs the **failed jobs** together with the jobs that depend on them (for the
+build: the skipped `merge` jobs). That repeats up to **3 attempts in total**.
+Only when the last attempt fails too does it open (or comment on) an issue
+titled `Scheduled run failing: <workflow name>`. It does the same if the retry
+itself breaks, so a failure can never go unreported.
+
+How it fits together:
+
+- It is triggered by `workflow_run` on the **first** attempt only and then
+  watches the further attempts itself, so their completion events do not start
+  a second retry chain. `workflow_run` only fires for workflow files on the
+  default branch: changes to it only take effect once merged to `main`.
+- The watched workflows are matched by their `name:`. Renaming one of them
+  means updating the list in `retry-scheduled.yml`.
+- Push and PR runs are **not** retried: a red run there is meant to be seen
+  straight away.
+- Trade-off: a real defect now reaches the issue tracker roughly
+  2 × (5 min + run time) later — with a cached build taking about 6 minutes,
+  roughly 20–25 minutes after the first failure; longer on the Sunday no-cache
+  build.
+- Attempts and their outcomes appear in the summary of the "Retry failed
+  scheduled runs" run. The re-runs themselves show up as attempt 2/3 of the
+  original run (attempt selector in the Actions UI).
+
+Note what a failed build means: nothing is broken for consumers, since the
+previous tags stay published — but security updates have silently stopped
 arriving. That is exactly the failure mode worth an alert.
+
+`security-scan.yml` counts a tag it could not scan as a failure rather than as
+zero findings. Before, a DB outage made every tag "unscannable", which added
+up to zero findings and closed the vulnerability issue as if all images were
+clean.
 
 ### The one thing to watch
 
@@ -659,8 +712,16 @@ take the new hash: check the upstream repository for a force-pushed tag first.
 **Build fails with `curl: (22)` while fetching an extension.**
 github.com did not answer after five retries. This is rare from GitHub-hosted
 runners; check [githubstatus.com](https://www.githubstatus.com) and re-run the
-failed jobs (`gh run rerun <run-id> --failed`). The "Nightly image build is
-failing" issue is not closed automatically: close it after the next green run.
+failed jobs (`gh run rerun <run-id> --failed`). The "Scheduled run failing: …"
+issue is not closed automatically: close it after the next green run.
+
+**Trivy step fails with `failed to download vulnerability DB`.**
+Only possible once both registries (`mirror.gcr.io` and `ghcr.io`) have failed
+in all three rounds of `Download Trivy vulnerability DB`. The step log shows one
+`::warning::` per failed attempt. It is an outage on Aqua's or Google's side,
+not a finding in the image; `retry-scheduled.yml` re-runs the job on its own.
+If it persists, check whether the DB was moved: the Trivy release notes
+announce new default `--db-repository` values.
 
 ---
 
