@@ -238,7 +238,7 @@ jobs:
       # script for the outage that made this necessary. The scan itself then
       # runs offline against that DB.
       - name: Install Trivy
-        uses: aquasecurity/setup-trivy@v0.2.6
+        uses: aquasecurity/setup-trivy@v0.3.1
         with:
           version: v0.70.0
           cache: true

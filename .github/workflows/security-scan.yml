@@ -44,7 +44,7 @@ jobs:
       # Same pinned Trivy as the build-time scan in build.yml, so both scans
       # judge with the same version. Keep the two in sync.
       - name: Install Trivy
-        uses: aquasecurity/setup-trivy@v0.2.6
+        uses: aquasecurity/setup-trivy@v0.3.1
         with:
           version: v0.70.0
           cache: true
