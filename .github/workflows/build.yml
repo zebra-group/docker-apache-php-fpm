@@ -75,7 +75,7 @@ jobs:
           SHELLCHECK_VERSION: v0.11.0
           # Bump together with the version. A release asset can be replaced;
           # the hash makes that fail instead of running unknown code.
-          SHELLCHECK_SHA256: 02df2c46b844a16c4d898240223a8acb1e23c821ae121fda1493eb187790ec57
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
         run: |
           set -euo pipefail
           curl -fsSL -o /tmp/shellcheck.tar.xz \
