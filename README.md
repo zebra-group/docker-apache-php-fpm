@@ -45,9 +45,9 @@ The existing tags remain in the registry but are frozen.
 | Endpoint | |
 |---|---|
 | `/healthz` | Liveness, served from disk without touching PHP |
-| `/fpm-ping` | `pong` via Apache → PHP-FPM (proves the whole chain); container-local |
-| `/fpm-status` | PHP-FPM pool metrics; container-local |
-| `/server-status` | Apache MPM state; container-local |
+| `/fpm-ping` | `pong` via Apache → PHP-FPM (proves the whole chain); loopback-only port `8081` |
+| `/fpm-status` | PHP-FPM pool metrics; loopback-only port `8081` |
+| `/server-status` | Apache MPM state; loopback-only port `8081` |
 
 Logs go to stdout/stderr only — `docker logs` is the single source of truth. The
 container exits if either Apache or PHP-FPM dies, and ships a `HEALTHCHECK`.
@@ -71,7 +71,8 @@ services:
       PHP_SESSION_PATH: tcp://redis:6379
       # Required together behind a load balancer, or all client IPs are the proxy's:
       APACHE_REMOTE_IP_HEADER: X-Forwarded-For
-      APACHE_REMOTE_IP_TRUSTED_PROXY: 10.0.0.0/8
+      # Your proxy's address or subnet — never a whole private block (see docs):
+      APACHE_REMOTE_IP_TRUSTED_PROXY: 172.18.0.10
     deploy:
       resources:
         limits:

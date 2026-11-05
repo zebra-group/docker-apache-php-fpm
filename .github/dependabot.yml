@@ -1,7 +1,9 @@
 version: 2
 
 updates:
-  # The workflows pin every action to a major version. Those pins go stale
+  # The workflows pin first-party actions to a version tag and third-party
+  # actions to a commit SHA with the tag as a trailing comment. Dependabot
+  # updates both forms (SHA and comment together). Those pins go stale
   # silently — a deprecated action keeps working until the day it does not.
   - package-ecosystem: github-actions
     directory: /

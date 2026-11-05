@@ -31,10 +31,10 @@ on:
       - '.github/php-versions.json'
       - '.github/workflows/build.yml'
 
-# The default token is read-only for contents; pushing to GHCR needs packages.
+# Read-only by default. packages: write is granted per job, only to the jobs
+# that push (build, merge) — lint runs third-party tooling and never needs it.
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -50,10 +50,14 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       php_versions: ${{ steps.versions.outputs.php_versions }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # .github/php-versions.json is the single list of built PHP versions:
       # build and merge read it from here, security-scan.yml reads the file.
@@ -69,12 +73,16 @@ jobs:
       - name: Lint shell scripts
         env:
           SHELLCHECK_VERSION: v0.11.0
+          # Bump together with the version. A release asset can be replaced;
+          # the hash makes that fail instead of running unknown code.
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
         run: |
           set -euo pipefail
-          curl -fsSL \
-            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
-            | tar -xJf - --strip-components=1 -C /usr/local/bin \
-              "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          curl -fsSL -o /tmp/shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  /tmp/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/shellcheck.tar.xz --strip-components=1 -C /usr/local/bin \
+            "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
           shellcheck --version
           shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh \
             .github/scripts/apt-index-fingerprint.sh .github/scripts/trivy-db-download.sh \
@@ -84,7 +92,7 @@ jobs:
         run: test/trivy-db-download-test.sh
 
       - name: Lint Dockerfile
-        uses: hadolint/hadolint-action@v3.5.0
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
         with:
           dockerfile: docker/Dockerfile
           # DL3008: we deliberately do not pin apt versions — the daily rebuild
@@ -95,6 +103,12 @@ jobs:
       # already fanned out — eight jobs burned before anything is built. Checking
       # the refs up front costs a few seconds and catches it here instead.
       #
+      # Third-party actions are pinned to a commit SHA with the tag as a trailing
+      # comment (`@<sha> # vX.Y.Z`), because a tag can be moved by whoever
+      # controls that repository, and these steps run in jobs whose token can
+      # push the production image. For those, the check also requires the
+      # commented tag to resolve to exactly that SHA, so the comment cannot lie.
+      #
       # Uses git ls-remote rather than the REST API on purpose: GITHUB_TOKEN is
       # scoped to this repository and cannot read refs from the action repos, so
       # an API-based check reports every external action as missing. ls-remote
@@ -103,18 +117,34 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t refs < <(
-            grep -rhoE "uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+" .github/workflows/ \
-              | sed 's/uses: //' | sort -u
+            grep -rhoE "uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+( # [A-Za-z0-9_.-]+)?" .github/workflows/ \
+              | sed -e 's/uses: //' -e 's/ # /#/' | sort -u
           )
           missing=0
           for ref in "${refs[@]}"; do
             repo="${ref%@*}"
-            tag="${ref#*@}"
-            if git ls-remote --exit-code --tags \
-                 "https://github.com/${repo}.git" "refs/tags/${tag}" > /dev/null 2>&1; then
-              echo "ok      ${ref}"
+            pin="${ref#*@}"
+            pin="${pin%%#*}"
+            tag=""
+            [ "${ref#*#}" != "${ref}" ] && tag="${ref#*#}"
+            if [[ "${pin}" =~ ^[0-9a-f]{40}$ ]]; then
+              # Annotated tags point at a tag object; the peeled ^{} entry is the
+              # commit. Lightweight tags have no ^{} entry.
+              resolved="$(git ls-remote --tags "https://github.com/${repo}.git" \
+                            "refs/tags/${tag}" "refs/tags/${tag}^{}" 2>/dev/null \
+                          | awk -v t="refs/tags/${tag}" '{ sha[$2] = $1 }
+                              END { print ((t "^{}") in sha ? sha[t "^{}"] : sha[t]) }')"
+              if [ -n "${tag}" ] && [ "${resolved}" = "${pin}" ]; then
+                echo "ok      ${repo}@${pin} (${tag})"
+              else
+                echo "MISSING ${repo}@${pin}: tag '${tag}' resolves to '${resolved:-nothing}'"
+                missing=1
+              fi
+            elif git ls-remote --exit-code --tags \
+                 "https://github.com/${repo}.git" "refs/tags/${pin}" > /dev/null 2>&1; then
+              echo "ok      ${repo}@${pin}"
             else
-              echo "MISSING ${ref}"
+              echo "MISSING ${repo}@${pin}"
               missing=1
             fi
           done
@@ -138,6 +168,9 @@ jobs:
     name: PHP ${{ matrix.php_version }} (${{ matrix.platform.arch }})
     needs: lint
     runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -159,6 +192,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # No QEMU: each runner builds for its own architecture.
       - name: Set up Docker Buildx
@@ -238,7 +273,7 @@ jobs:
       # script for the outage that made this necessary. The scan itself then
       # runs offline against that DB.
       - name: Install Trivy
-        uses: aquasecurity/setup-trivy@v0.3.1
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         with:
           version: v0.70.0
           cache: true
@@ -247,7 +282,7 @@ jobs:
         run: .github/scripts/trivy-db-download.sh "${{ github.workspace }}/.cache/trivy"
 
       - name: Scan for vulnerabilities
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_SKIP_DB_UPDATE: 'true'
         with:
@@ -319,6 +354,9 @@ jobs:
     needs: [lint, build]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:

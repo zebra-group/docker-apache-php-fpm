@@ -246,8 +246,24 @@ Two design points worth keeping:
 the unit tests of the CI scripts.
 
 **Secrets:** none to configure. The workflow uses the automatically provided
-`GITHUB_TOKEN` with `packages: write`, declared explicitly in the `permissions`
-block.
+`GITHUB_TOKEN`. The workflow default is `contents: read`; only the `build` and
+`merge` jobs, which push, get `packages: write`. `lint` runs third-party tooling
+and keeps a read-only token. Checkouts use `persist-credentials: false`.
+
+**Third-party code in CI is pinned to content, not names.** A git tag or a
+release asset can be replaced by whoever controls that repository, and the code
+then runs with a token that can push the production image within 24 h (daily
+cron). So:
+
+- third-party actions (`aquasecurity/*`, `hadolint/*`) are pinned to a commit SHA
+  with the tag as a trailing comment: `uses: owner/action@<sha> # vX.Y.Z`.
+  First-party `actions/*` and `docker/*` stay on version tags. Dependabot
+  updates both forms.
+- the `Verify all referenced action versions exist` step checks that each
+  commented tag still resolves to exactly the pinned SHA, so the comment cannot
+  drift from the pin.
+- the shellcheck tarball is checked against `SHELLCHECK_SHA256`. **Bumping
+  `SHELLCHECK_VERSION` means updating the hash too.**
 
 **Caching:** GitHub Actions cache (`type=gha`), scoped per PHP version *and*
 architecture (`scope=php-8.4-arm64`). The scope matters — with a shared key the
@@ -441,7 +457,7 @@ those are generated.
 | `PHP_OPCACHE_MEMORY` | `256` | MB, shared across all workers. |
 | `PHP_OPCACHE_VALIDATE_TIMESTAMPS` | `0` | **`0` means code changes are not picked up without a restart.** Set `1` for bind-mounted development code. |
 | `PHP_OPCACHE_REVALIDATE_FREQ` | `2` | Only applies when the above is `1`. |
-| `PHP_OPCACHE_FILE_CACHE` | `/tmp/opcache` | On-disk opcode cache; cheaper cold starts. |
+| `PHP_OPCACHE_FILE_CACHE` | `/tmp/opcache` | On-disk opcode cache; cheaper cold starts. Created and checked as `www-data`, never chowned by root — a mounted volume must already be owned by `www-data` (uid 33), otherwise the entrypoint warns and the file cache stays empty. **Do not put it below an application-writable directory** such as `/var/www/html`: `www-data` could swap it for a symlink between restarts. |
 | `PHP_OPCACHE_JIT` | `off` | `tracing` to enable. Off by default on purpose — see §5. |
 | `PHP_OPCACHE_JIT_BUFFER_SIZE` | `128M` | |
 | `PHP_OPCACHE_PRELOAD` | *(empty)* | Path to a preload script. Big win for TYPO3 v11+/Symfony. |
@@ -468,6 +484,7 @@ those are generated.
 |---|---|---|
 | `APACHE_SERVER_NAME` | `localhost` | |
 | `APACHE_PORT` | `80` | |
+| `APACHE_STATUS_PORT` | `8081` | Loopback-only listener (`127.0.0.1`) for `/fpm-ping`, `/fpm-status`, `/server-status`. Must differ from `APACHE_PORT`. |
 | `APACHE_MAX_REQUEST_WORKERS` | `128` | Worker threads. Rounded to a multiple of `APACHE_THREADS_PER_CHILD`. |
 | `APACHE_THREADS_PER_CHILD` | `32` | `ServerLimit` is derived from these two. |
 | `APACHE_TIMEOUT` | `60` | |
@@ -477,7 +494,7 @@ those are generated.
 | `APACHE_MAX_KEEPALIVE_REQUESTS` | `100` | |
 | `APACHE_MAX_CONNECTIONS_PER_CHILD` | `0` | `0` = never recycle. PHP is out-of-process, so recycling only costs restarts. |
 | `APACHE_ALLOW_OVERRIDE` | `All` | `None` removes a `stat()` per directory level per request — only once `.htaccess` rules are baked into `conf.d/`. |
-| `APACHE_ASSET_CACHE_MAX_AGE` | `2592000` | Seconds, static assets (30 days). |
+| `APACHE_ASSET_CACHE_MAX_AGE` | `2592000` | Seconds, static assets (30 days). Sent as `max-age` without `public`, so a shared cache never reuses an HTTP-auth-protected asset for anonymous users. |
 | `APACHE_BROTLI` | `On` | |
 | `APACHE_BROTLI_QUALITY` | `5` | 1–11. Above ~6 costs more CPU than it saves bandwidth for dynamic output. |
 | `APACHE_DEFLATE_LEVEL` | `6` | |
@@ -497,14 +514,19 @@ the TYPO3 backend IP lock, WordPress login throttling) silently misbehaves.
 ```yaml
 environment:
   APACHE_REMOTE_IP_HEADER: X-Forwarded-For
-  APACHE_REMOTE_IP_TRUSTED_PROXY: 10.0.0.0/8 172.16.0.0/12
+  APACHE_REMOTE_IP_TRUSTED_PROXY: 172.18.0.10    # your proxy's address or subnet
 ```
 
 Both are required. Setting only the header would let **any client forge its own
 IP address** by sending `X-Forwarded-For`, so the entrypoint refuses to enable
 `mod_remoteip` and logs a warning instead.
 
-Set the trusted range to your proxy's actual network. Note that `mod_remoteip`
+Set the trusted range to your proxy's **actual address or subnet**, never a whole
+private block. Every host inside the range may set any public client address,
+and `10.0.0.0/8` or `172.16.0.0/12` also cover other containers on the same
+Docker network and SNATed external traffic (Swarm routing mesh, Kubernetes
+`externalTrafficPolicy: Cluster`). The entrypoint warns about IPv4 ranges wider
+than `/16` (IPv6 wider than `/48`). Note that `mod_remoteip`
 **rejects `0.0.0.0/0`** outright (`Error parsing IP ... network mask is
 invalid`), so there is no catch-all shortcut — and an unparseable value stops the
 container at startup rather than quietly running without the trust
@@ -620,21 +642,30 @@ Beyond one container, these must be shared rather than container-local:
 
 ### Health
 
-Two endpoints, both restricted to inside the container except `/healthz`:
+`/healthz` is on the public port. The other three exist **only on a separate
+listener bound to `127.0.0.1:${APACHE_STATUS_PORT}`** (default `8081`):
 
 | Endpoint | Purpose |
 |---|---|
-| `/healthz` | Static file, no PHP. For load balancer probes that should be cheap. |
-| `/fpm-ping` | Returns `pong` through Apache → PHP-FPM. Proves the whole chain. |
-| `/fpm-status` | Pool metrics. `Require local`. |
-| `/server-status` | Apache MPM state. `Require local`. |
+| `/healthz` | Public port. Static file, no PHP. For load balancer probes that should be cheap. |
+| `/fpm-ping` | Status port. Returns `pong` through Apache → PHP-FPM. Proves the whole chain. |
+| `/fpm-status` | Status port. Pool metrics. |
+| `/server-status` | Status port. Apache MPM state, client IPs and request lines. |
+
+They used to sit on the public port behind `Require local` only. That passes for
+every request a proxy in the container's network namespace relays over loopback
+(service-mesh sidecar, Compose `network_mode: service:<proxy>`, host-network
+proxy), which exposed other clients' URLs and query strings. A loopback-bound
+listener is not reachable through such a relay. Do not publish or forward
+`APACHE_STATUS_PORT`; scrape it from inside the container (or a sidecar in the
+same namespace that you control).
 
 The image's `HEALTHCHECK` uses `/fpm-ping`, so Docker reports `unhealthy` when
 PHP-FPM stops answering — the previous image had no healthcheck and would report
 `running` while serving 503s to every request.
 
 ```sh
-docker exec web curl -s localhost/fpm-status
+docker exec web curl -s localhost:8081/fpm-status
 docker inspect -f '{{.State.Health.Status}}' web
 ```
 
