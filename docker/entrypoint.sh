@@ -80,6 +80,8 @@ PHP_FPM_SOCKET=/run/php-fpm.sock
 : "${APACHE_ASSET_CACHE_MAX_AGE:=2592000}"
 : "${APACHE_REMOTE_IP_HEADER:=}"
 : "${APACHE_REMOTE_IP_TRUSTED_PROXY:=}"
+# Loopback-only listener for /fpm-status, /fpm-ping and /server-status.
+: "${APACHE_STATUS_PORT:=8081}"
 
 # =============================================================================
 # Derive PHP-FPM worker count
@@ -294,6 +296,25 @@ if [ -n "${APACHE_REMOTE_IP_TRUSTED_PROXY}" ]; then
         echo "RemoteIPTrustedProxy ${APACHE_REMOTE_IP_TRUSTED_PROXY}"
     } > "${remoteip_conf}"
     log "mod_remoteip active for proxies: ${APACHE_REMOTE_IP_TRUSTED_PROXY}"
+
+    # Every peer inside a trusted range may set any public client address. A
+    # whole RFC1918 block (10.0.0.0/8, 172.16.0.0/12) also covers co-tenant
+    # containers and SNATed ingress traffic (Swarm routing mesh, Kubernetes
+    # externalTrafficPolicy=Cluster), not just the proxy.
+    for proxy in ${APACHE_REMOTE_IP_TRUSTED_PROXY}; do
+        case "${proxy}" in
+            */*) prefix="${proxy##*/}" ;;
+            *)   continue ;;
+        esac
+        case "${prefix}" in *[!0-9]*|"") continue ;; esac
+        if { [ "${proxy#*:}" = "${proxy}" ] && [ "${prefix}" -lt 16 ]; } \
+           || { [ "${proxy#*:}" != "${proxy}" ] && [ "${prefix}" -lt 48 ]; }; then
+            warn "APACHE_REMOTE_IP_TRUSTED_PROXY contains the broad range ${proxy}:" \
+                 "every host in it can forge its client IP via" \
+                 "${APACHE_REMOTE_IP_HEADER:-X-Forwarded-For}. Narrow it to your" \
+                 "proxy's actual address or subnet."
+        fi
+    done
 elif [ -n "${APACHE_REMOTE_IP_HEADER}" ]; then
     # Honouring X-Forwarded-For from any source lets a client forge its own IP,
     # defeating rate limits, IP allowlists and the TYPO3 backend IP lock.
@@ -302,11 +323,32 @@ elif [ -n "${APACHE_REMOTE_IP_HEADER}" ]; then
          "its address. Set the trusted proxy range to enable it."
 fi
 
+# Listen ${APACHE_PORT} binds every address, including loopback, so the status
+# listener cannot share the port.
+if [ "${APACHE_STATUS_PORT}" = "${APACHE_PORT}" ]; then
+    log "APACHE_STATUS_PORT must differ from APACHE_PORT (both ${APACHE_PORT})"
+    exit 1
+fi
+
 # =============================================================================
 # Prepare runtime directories
 # =============================================================================
-mkdir -p /var/run/apache2 "${PHP_OPCACHE_FILE_CACHE}"
-chown www-data:www-data "${PHP_OPCACHE_FILE_CACHE}"
+mkdir -p /var/run/apache2
+
+# Created and checked as www-data, never chowned by root: www-data can replace
+# any www-data-owned component of this path with a symlink between two starts,
+# and a root `chown` would then hand the symlink's target (e.g. a directory of
+# binaries root executes) to www-data. The default /tmp/opcache already exists
+# owner www-data in the image; this branch only covers a tmpfs /tmp or a custom
+# path.
+if [ ! -d "${PHP_OPCACHE_FILE_CACHE}" ]; then
+    runuser -u www-data -- mkdir -p "${PHP_OPCACHE_FILE_CACHE}" \
+        || warn "cannot create PHP_OPCACHE_FILE_CACHE (${PHP_OPCACHE_FILE_CACHE}) as www-data"
+fi
+runuser -u www-data -- test -w "${PHP_OPCACHE_FILE_CACHE}" \
+    || warn "PHP_OPCACHE_FILE_CACHE (${PHP_OPCACHE_FILE_CACHE}) is not writable by" \
+            "www-data — the OPcache file cache stays empty. A mounted volume must" \
+            "be owned by www-data (uid 33)."
 rm -f "${PHP_FPM_SOCKET}" /var/run/apache2/apache2.pid
 
 # Apache reads ${...} in its config from this environment.
@@ -318,7 +360,7 @@ export APACHE_SERVER_NAME APACHE_PORT APACHE_TIMEOUT APACHE_KEEPALIVE \
        APACHE_BROTLI APACHE_BROTLI_QUALITY APACHE_DEFLATE_LEVEL \
        APACHE_ASSET_CACHE_MAX_AGE APACHE_PROXY_TIMEOUT \
        APACHE_START_SERVERS APACHE_MIN_SPARE_THREADS APACHE_MAX_SPARE_THREADS \
-       PHP_FPM_SOCKET
+       APACHE_STATUS_PORT PHP_FPM_SOCKET
 export APACHE_SERVER_LIMIT="${apache_server_limit}"
 
 # Fail loudly at startup rather than half-serving a broken config.

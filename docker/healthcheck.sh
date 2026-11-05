@@ -10,7 +10,8 @@
 #
 set -euo pipefail
 
-port="${APACHE_PORT:-80}"
+# The status endpoints only exist on the loopback-only status listener.
+port="${APACHE_STATUS_PORT:-8081}"
 
 response="$(curl --fail --silent --show-error --max-time 4 \
                  "http://127.0.0.1:${port}/fpm-ping" 2>&1)" || {

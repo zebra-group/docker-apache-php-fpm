@@ -205,6 +205,8 @@ fi
 
 startup_logs="$(docker logs "${CONTAINER}" 2>&1)"
 assert_contains "entrypoint logs derived sizing" "${startup_logs}" "php-fpm:"
+assert_eq "default opcache file cache is owned by www-data" "www-data" \
+    "$(in_container stat -c %U /tmp/opcache 2>/dev/null || echo missing)"
 assert_not_contains "no undefined Apache config variables" "${startup_logs}" "is not defined"
 assert_not_contains "no Apache config warnings at startup" "${startup_logs}" "AH00117"
 assert_not_contains "MaxRequestWorkers is a multiple of ThreadsPerChild" \
@@ -226,8 +228,10 @@ assert_not_contains "PHP response is not publicly cacheable" \
     "$(printf '%s' "${php_headers}" | tr '[:upper:]' '[:lower:]' | grep -i '^cache-control' || echo '')" "public"
 
 css_headers="$(curl -sSI "${BASE}/style.css")"
-assert_contains "static asset is publicly cacheable" \
-    "$(printf '%s' "${css_headers}" | tr '[:upper:]' '[:lower:]')" "public"
+# `public` let an RFC 9111 shared cache reuse an HTTP-auth-protected asset for
+# anonymous users; max-age alone keeps anonymous assets cacheable.
+assert_not_contains "static asset is not marked public" \
+    "$(printf '%s' "${css_headers}" | tr '[:upper:]' '[:lower:]' | grep -i '^cache-control' || echo '')" "public"
 assert_contains "static asset has a long max-age" \
     "${css_headers}" "max-age=2592000"
 # immutable strands clients on stale query-string-versioned assets.
@@ -357,18 +361,31 @@ assert_contains "fpm status path configured" "${fpm_conf}" "pm.status_path = /fp
 bold "==> Monitoring endpoints"
 # =============================================================================
 
-ping="$(in_container curl -fsS "http://127.0.0.1/fpm-ping")"
-assert_eq "fpm-ping answers from inside" "pong" "${ping}"
+ping="$(in_container curl -fsS "http://127.0.0.1:8081/fpm-ping")"
+assert_eq "fpm-ping answers on the status port" "pong" "${ping}"
 
-status="$(in_container curl -fsS "http://127.0.0.1/fpm-status")"
-assert_contains "fpm-status exposes pool metrics" "${status}" "idle processes"
+status="$(in_container curl -fsS "http://127.0.0.1:8081/fpm-status")"
+assert_contains "fpm-status exposes pool metrics on the status port" "${status}" "idle processes"
+
+server_status="$(in_container curl -fsS "http://127.0.0.1:8081/server-status?auto")"
+assert_contains "server-status answers on the status port" "${server_status}" "BusyWorkers"
 
 healthz="$(curl -fsS "${BASE}/healthz")"
 assert_eq "healthz served without PHP" "ok" "${healthz}"
 
 # Must not be reachable from outside the container.
 ext_status="$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/fpm-status")"
-assert_eq "fpm-status blocked from outside" "403" "${ext_status}"
+if [ "${ext_status}" != "200" ]; then ok "fpm-status not served from outside (${ext_status})"
+else bad "fpm-status not served from outside" "got 200"; fi
+
+# A proxy in the container's network namespace (sidecar, network_mode:
+# service:) reaches the public port from loopback. `Require local` passed for
+# exactly that, so the status endpoints must not exist on the public port at all.
+for path in fpm-status fpm-ping server-status; do
+    lo_code="$(in_container curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/${path}")"
+    if [ "${lo_code}" != "200" ]; then ok "/${path} not served on the public port via loopback (${lo_code})"
+    else bad "/${path} not served on the public port via loopback" "got 200"; fi
+done
 
 # The container's own healthcheck must pass.
 health_state=""
@@ -400,7 +417,7 @@ logfiles="$(in_container sh -c 'find /var/log/apache2 -type f -size +0 2>/dev/nu
 assert_eq "no log files written inside the container" "0" "${logfiles}"
 
 # Health probes must not spam the access log.
-in_container curl -fsS "http://127.0.0.1/fpm-ping" >/dev/null
+in_container curl -fsS "http://127.0.0.1:8081/fpm-ping" >/dev/null
 sleep 1
 ping_logged="$(docker logs "${CONTAINER}" 2>&1 | grep -c 'fpm-ping' || true)"
 assert_eq "health probes excluded from access log" "0" "${ping_logged}"
@@ -554,6 +571,10 @@ curl -fsS -H 'X-Forwarded-For: 203.0.113.42' "${BASE}/index.php" >/dev/null
 sleep 1
 assert_contains "real client IP appears in access log via mod_remoteip" \
     "$(docker logs "${CONTAINER}" 2>&1)" "203.0.113.42"
+# Every host in a whole private block may forge its client IP; the docs used to
+# recommend exactly these ranges.
+assert_contains "broad trusted-proxy range is warned about" \
+    "$(docker logs "${CONTAINER}" 2>&1)" "contains the broad range 10.0.0.0/8"
 
 # A malformed proxy list must stop the container rather than silently run
 # without the trust configuration the operator asked for.
@@ -574,6 +595,31 @@ else
     bad "invalid trusted-proxy value fails the container at startup" \
         "container kept running with a rejected mod_remoteip config"
 fi
+
+# The entrypoint runs as root and used to `chown` PHP_OPCACHE_FILE_CACHE on
+# every start. www-data could swap that path for a symlink between restarts and
+# so get a root-owned directory handed over.
+docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+docker run -d --name "${CONTAINER}" -p "${PORT}:80" \
+    -e PHP_OPCACHE_FILE_CACHE=/var/www/html/var/opcache \
+    "${IMAGE}" >/dev/null
+for _ in $(seq 1 60); do
+    curl -fsS --max-time 2 "${BASE}/healthz" >/dev/null 2>&1 && break
+    sleep 0.5
+done
+assert_eq "custom opcache file cache is created as www-data" "www-data" \
+    "$(in_container stat -c %U /var/www/html/var/opcache 2>/dev/null || echo missing)"
+docker exec -u www-data "${CONTAINER}" sh -c \
+    'rm -rf /var/www/html/var/opcache && ln -s /usr/local/etc/php-fpm.d /var/www/html/var/opcache'
+docker restart "${CONTAINER}" >/dev/null
+for _ in $(seq 1 60); do
+    curl -fsS --max-time 2 "${BASE}/healthz" >/dev/null 2>&1 && break
+    sleep 0.5
+done
+assert_eq "symlinked opcache path does not hand a root directory to www-data" "root" \
+    "$(in_container stat -c %U /usr/local/etc/php-fpm.d 2>/dev/null || echo missing)"
+assert_contains "unwritable opcache path is warned about" \
+    "$(docker logs "${CONTAINER}" 2>&1)" "is not writable by"
 
 # =============================================================================
 bold "==> Passthrough commands"
